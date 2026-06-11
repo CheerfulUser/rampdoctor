@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rampdoctor"
+version = "0.1.0"
+description = "Brighter-fatter and reset-decay corrections for JWST up-the-ramp data"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Ryan Ridden-Harper", email = "ryanridden@gmail.com"},
+]
+keywords = ["JWST", "MIRI", "brighter-fatter", "ramp", "detector"]
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "astropy",
+    "sep",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib"]
+
+[project.urls]
+Homepage = "https://github.com/ryanridden/rampdoctor"
+
+[tool.setuptools.packages.find]
+include = ["rampdoctor*"]
