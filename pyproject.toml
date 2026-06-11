@@ -27,6 +27,7 @@ dependencies = [
 
 [project.optional-dependencies]
 plot = ["matplotlib"]
+test = ["pytest", "matplotlib"]
 
 [project.urls]
 Homepage = "https://github.com/CheerfulUser/rampdoctor"
