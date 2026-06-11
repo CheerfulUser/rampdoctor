@@ -29,7 +29,7 @@ dependencies = [
 plot = ["matplotlib"]
 
 [project.urls]
-Homepage = "https://github.com/ryanridden/rampdoctor"
+Homepage = "https://github.com/CheerfulUser/rampdoctor"
 
 [tool.setuptools.packages.find]
 include = ["rampdoctor*"]
