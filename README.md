@@ -4,8 +4,22 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org)
 
-Brighter-fatter effect (BFE) and reset charge decay (RCD) corrections for
-JWST up-the-ramp data, developed and validated on MIRI imaging ramps.
+`rampdoctor` corrects two detector systematics in JWST up-the-ramp data at
+the group level, before ramp fitting. The **brighter-fatter effect (BFE)**
+redistributes charge from bright pixels into their neighbours as the wells
+fill, broadening the PSF over the course of an integration and biasing
+aperture photometry built from group differences. **Reset charge decay
+(RCD)** adds an exponentially decaying signal to the first few groups after
+each detector reset, imprinting a common ramp-shaped systematic on every
+integration. Both effects are fit directly from the science data — no
+reference files are required: the BFE amplitude is fit from the
+brighter-fatter signature of the brightest source in the field, and the
+decay timescale from background pixels. Applying the joint correction to a
+JWST MIRI imaging time series of EV Lac reduces the group-level lightcurve
+RMS from 2.48% to 0.15%. The method operates on `uncal` SCI cubes
+(`n_int, n_groups, ny, nx`) and is developed and validated on MIRI, but the
+approach applies to any instrument with non-destructive up-the-ramp
+sampling.
 
 ## Installation
 
