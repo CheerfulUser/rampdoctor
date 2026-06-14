@@ -20,32 +20,35 @@ def make_cube(n_int=6, n_groups=10, ny=50, nx=50, star=True, seed=0):
     return cube
 
 
-def make_bfe_cube(A_bfe=1e-6, alpha=2.797, n_int=4, n_groups=8,
+def make_bfe_cube(A_bfe=1e-6, alpha=2.797, b=-0.5, c=0.05, n_int=6, n_groups=12,
                   ny=120, nx=120, seed=1):
-    """Synthetic cube with a bright Gaussian star and a BFE imprint from
-    the pixel-area forward model grad_obs = tg * (1 - A * K convolved Q)."""
+    """Synthetic cube with a bright Gaussian star and a BFE imprint from the
+    source-centric forward model grad_obs = tg - A * K convolved (Q * tg), with
+    the flux-conserving quadratic-numerator kernel K = -(1 + b r + c r^2)/r^a.
+    This matches the model fit by fit_bfe_params, so A is recoverable. The peak
+    rate and reset-decay are at realistic levels so the global tau and the
+    rate/decay decomposition are well determined."""
     from scipy.signal import fftconvolve
     rng = np.random.default_rng(seed)
 
     yy, xx = np.mgrid[:ny, :nx]
     r2 = (yy - ny // 2)**2 + (xx - nx // 2)**2
-    rate = 10.0 + 30000.0 * np.exp(-r2 / (2 * 2.0**2))
+    rate = 10.0 + 8000.0 * np.exp(-r2 / (2 * 2.0**2))
     g = np.arange(n_groups - 1)
-    decay = 3.0 * np.exp(-g / 1.5)
+    decay = 300.0 * np.exp(-g / 1.5)
 
     kh = 20
     ii, jj = np.mgrid[-kh:kh + 1, -kh:kh + 1].astype(float)
     rk = np.sqrt(ii**2 + jj**2)
     with np.errstate(divide='ignore', invalid='ignore'):
-        K = np.where(rk > 0, -1.0 / rk**alpha, 0.0)
+        K = np.where(rk > 0, -(1.0 + b * rk + c * rk**2) / rk**alpha, 0.0)
     K[kh, kh] = -K.sum()
 
     Q = np.zeros((ny, nx))
     grads_obs = np.zeros((n_groups - 1, ny, nx))
     for gi in range(n_groups - 1):
         tg = rate + decay[gi]
-        KQ = fftconvolve(Q, K, mode='same')
-        grads_obs[gi] = tg * (1.0 - A_bfe * KQ)
+        grads_obs[gi] = tg - A_bfe * fftconvolve(Q * tg, K, mode='same')
         Q += tg
 
     grads = (grads_obs[None]

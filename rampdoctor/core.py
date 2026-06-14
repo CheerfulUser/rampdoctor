@@ -25,7 +25,10 @@ class RampDoctor:
     A_bfe : float
         BFE kernel amplitude (default 1.035e-6).
     alpha_bfe : float
-        BFE kernel power-law index (default 2.797).
+        BFE kernel power-law index (default 3.43, bright-star consensus).
+    b_bfe, c_bfe : float
+        Quadratic-numerator coefficients of K = -(1 + b r + c r^2)/r^alpha
+        (defaults -0.50, 0.056). Overwritten by fit_bfe().
     bg_mask : ndarray (ny, nx) bool, optional
         True = background pixels for the global tau fit.
     sci_mask : ndarray (ny, nx) bool, optional
@@ -41,7 +44,8 @@ class RampDoctor:
     """
 
     def __init__(self, cube=None, file=None, dq=None, A_bfe=1.035e-6,
-                 alpha_bfe=2.797, bg_mask=None, sci_mask=None, verbose=False):
+                 alpha_bfe=3.43, b_bfe=-0.50, c_bfe=0.056,
+                 bg_mask=None, sci_mask=None, verbose=False):
         self.file = Path(file) if file is not None else None
         if file is not None:
             from astropy.io import fits
@@ -58,6 +62,8 @@ class RampDoctor:
         self.dq = dq
         self.A_bfe = A_bfe
         self.alpha_bfe = alpha_bfe
+        self.b_bfe = b_bfe
+        self.c_bfe = c_bfe
         self.bg_mask = bg_mask
         self.sci_mask = sci_mask
         self.verbose = verbose
@@ -107,16 +113,14 @@ class RampDoctor:
             cut=cut, fit_r=fit_r, verbose=self.verbose,
             diagnostics=diagnostics, save_path=save_path)
 
-        if fit_alpha:
-            A_fit, alpha_fit, sx, sy = result
-        else:
-            A_fit, sx, sy = result
-            alpha_fit = self.alpha_bfe
+        A_fit, alpha_fit, b_fit, c_fit, sx, sy = result
 
         if A_fit is None:
             return None
         self.A_bfe = A_fit
         self.alpha_bfe = alpha_fit
+        self.b_bfe = b_fit
+        self.c_bfe = c_fit
         self.star_x = sx
         self.star_y = sy
         return A_fit
@@ -153,6 +157,7 @@ class RampDoctor:
             self.fit_bfe(diagnostics=diagnostics)
         self.cube_cor = correct_bfe_rcd(
             self.cube, A_bfe=self.A_bfe, alpha_bfe=self.alpha_bfe,
+            b_bfe=self.b_bfe, c_bfe=self.c_bfe,
             bg_mask=self.bg_mask, late_groups=late_groups,
             sci_mask=self.sci_mask, verbose=self.verbose,
             diagnostics=diagnostics, save_path=save_path, **kwargs)

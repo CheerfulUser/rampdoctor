@@ -1,7 +1,7 @@
 import numpy as np
 from pathlib import Path
 from scipy.interpolate import griddata
-from scipy.optimize import curve_fit, minimize_scalar
+from scipy.optimize import curve_fit
 
 
 def build_correction_map(cube, mask=None):
@@ -271,17 +271,27 @@ def correct_reset_decay(cube, method='median', mask=None, mask_dilation=0,
     return cube_cor
 
 
-def fit_bfe_params(cube, alpha_bfe=2.797, bg_mask=None, sci_mask=None,
+def fit_bfe_params(cube, alpha_bfe=3.43, b_bfe=None, c_bfe=None,
+                   bg_mask=None, sci_mask=None,
                    bfe_early_groups=None, bfe_late_groups=None,
                    ap_radius=5, cut=20, fit_r=None, verbose=False,
-                   diagnostics=False, save_path=None):
+                   diagnostics=False, save_path=None, return_model=False):
     """
-    Find the brightest source in the image and fit A_bfe via the forward model.
+    Find the brightest source in the image and fit the BFE kernel via the
+    source-centric forward model, K = -(1 + b r + c r^2) / r^alpha.
 
     Uses SEP to locate the source, fits the reset-decay parameters (tau,
-    rate_map, Adec_map) from the median gradient, then fits A_bfe by
-    minimising the residual between the modelled and observed late−early
-    normalised PSF difference. alpha_bfe is held fixed.
+    rate_map, Adec_map) from the median gradient, then fits the BFE amplitude A
+    (and a constant background, jointly by linear least squares) by minimising
+    the residual between the modelled and observed late−early normalised PSF
+    difference. The kernel shape (alpha, b, c) is fit nonlinearly.
+
+    Three fitting modes, selected by the inputs:
+      * alpha_bfe=None              -> fit alpha, b, c, A, background.
+      * alpha_bfe set, b/c None     -> fix alpha, fit b, c, A, background.
+      * alpha_bfe, b_bfe, c_bfe set -> fix the whole kernel shape, fit only A
+        and background. Use this for faint sources, passing the consensus
+        kernel from brighter stars.
 
     The forward model runs on a cropped region around the star to keep
     the fftconvolve tractable on large detectors.
@@ -290,8 +300,13 @@ def fit_bfe_params(cube, alpha_bfe=2.797, bg_mask=None, sci_mask=None,
     ----------
     cube : ndarray (n_int, n_groups, ny, nx), float
         Raw ramp cube.
-    alpha_bfe : float
-        BFE kernel power-law index (fixed during fit, default 2.783).
+    alpha_bfe : float or None
+        BFE kernel power-law index (default 3.43, the bright-star consensus for
+        the quadratic-numerator kernel). If None it is fitted; otherwise fixed.
+    b_bfe, c_bfe : float or None
+        Quadratic-numerator coefficients. If both are given (with alpha_bfe set)
+        the kernel shape is fully fixed and only A and the background are fit;
+        if None they are fitted.
     bg_mask : ndarray (ny, nx) bool, optional
         True = background pixels for tau fitting. If None an annulus around
         the detected source is used.
@@ -320,7 +335,11 @@ def fit_bfe_params(cube, alpha_bfe=2.797, bg_mask=None, sci_mask=None,
     Returns
     -------
     A_bfe : float
-        Fitted BFE amplitude.
+        Fitted BFE amplitude (None if no source meets the threshold).
+    alpha : float
+        BFE kernel power-law index (fitted if alpha_bfe is None, else echoed).
+    b, c : float
+        Quadratic-numerator kernel coefficients K = -(1 + b r + c r^2)/r^alpha.
     sx, sy : int
         Detected star position (x, y).
     """
@@ -352,7 +371,7 @@ def fit_bfe_params(cube, alpha_bfe=2.797, bg_mask=None, sci_mask=None,
     if len(round_sources) == 0 or round_sources[np.argsort(round_sources['flux'])[-1]]['flux'] < 50000:
         if verbose:
             print('  No source meets brightness threshold — skipping BFE fit')
-        return None, nx // 2, ny // 2
+        return None, (alpha_bfe if alpha_bfe else 3.43), 0.0, 0.0, nx // 2, ny // 2
     round_sources = round_sources[np.argsort(round_sources['flux'])[::-1]]
     star = round_sources[0]
     sy, sx = int(round(star['y'])), int(round(star['x']))
@@ -407,103 +426,165 @@ def fit_bfe_params(cube, alpha_bfe=2.797, bg_mask=None, sci_mask=None,
         n_e = max(2, min(3, n_grads // 4))
         bfe_late_groups = list(range(n_grads - n_e, n_grads))
 
-    _ap_yy, _ap_xx = np.mgrid[:2*cut+1, :2*cut+1]
-    _ap_mask = np.sqrt((_ap_yy - cut)**2 + (_ap_xx - cut)**2) <= ap_radius
-
-    def _cutout(arr_3d, glist):
-        stack = np.median(arr_3d[np.array(glist)], axis=0)
-        c = stack[cy-cut:cy+cut+1, cx-cut:cx+cut+1]
-        return c / c[_ap_mask].sum()
-
-    def _cutout_perint(arr_4d, glist):
-        gl = np.array(glist)
-        cuts = []
-        for i in range(arr_4d.shape[0]):
-            stack = np.median(arr_4d[i, gl], axis=0)
-            c = stack[cy-cut:cy+cut+1, cx-cut:cx+cut+1]
-            cuts.append(c / c[_ap_mask].sum())
-        return np.array(cuts)
-
-    diff_perint = (_cutout_perint(grads_c, bfe_late_groups)
-                   - _cutout_perint(grads_c, bfe_early_groups))
-    obs_diff = np.median(diff_perint, axis=0)
-    noise_diff = np.std(diff_perint, axis=0) / np.sqrt(n_int)
-    noise_diff = np.clip(noise_diff, noise_diff[noise_diff > 0].min() * 0.1, None)
-
     yy_c, xx_c = np.mgrid[:2*cut+1, :2*cut+1]
     r_map_c = np.sqrt((yy_c - cut)**2 + (xx_c - cut)**2)
 
-    if fit_r is None:
-        snr_profile = np.array([
-            np.mean(np.abs(obs_diff[np.round(r_map_c).astype(int) == ri])) /
-            np.mean(noise_diff[np.round(r_map_c).astype(int) == ri])
-            for ri in range(1, cut)
-        ])
-        above = np.where(snr_profile > 2.0)[0]
-        fit_r = max(5, int(above[-1]) + 1) if len(above) > 0 else 5
-        if verbose:
-            print(f'  Auto fit_r = {fit_r} px (SNR-based)')
-
-    fit_mask = r_map_c <= fit_r
-
     ii, jj = np.mgrid[-kh:kh+1, -kh:kh+1].astype(float)
-    r = np.sqrt(ii**2 + jj**2)
+    rker = np.sqrt(ii**2 + jj**2)
 
-    def _make_kernel(al):
+    def _make_kernel(al, b, c):
+        # Flux-conserving BFE kernel: K = -(1 + b r + c r^2) / r^al, centre set
+        # to -(off-centre sum) so sum(K)=0. The quadratic numerator yields a
+        # compact kernel and a physical, source-independent index al~3.
         with np.errstate(divide='ignore', invalid='ignore'):
-            Kk = np.where(r > 0, -1.0 / r**al, 0.0)
+            Kk = np.where(rker > 0, -(1.0 + b * rker + c * rker**2) / rker**al, 0.0)
         Kk[kh, kh] = -Kk.sum()
         return Kk
 
-    def _simulate(A_bfe_val, al=alpha_bfe):
-        Kk = _make_kernel(al)
-        Q = np.zeros((nyc, nxc))
-        grads_s = np.zeros((n_grads, nyc, nxc))
+    def _build_true(rate_c, Adec_c, delta_c):
+        tg_all = np.zeros((n_grads, nyc, nxc))
+        Qg = np.zeros((n_grads, nyc, nxc))
+        Qa = np.zeros((nyc, nxc))
         for g in range(n_grads):
             tg = rate_c + Adec_c * np.exp(-g / tau)
             if g == 0:
                 tg = tg - delta_c
-            KQ = fftconvolve(Q, Kk, mode='same')
-            grads_s[g] = tg * (1.0 - A_bfe_val * KQ)
-            Q += tg
-        return grads_s
+            tg_all[g] = tg
+            Qg[g] = Qa
+            Qa = Qa + tg
+        return tg_all, Qg
 
-    if alpha_bfe is None:
-        from scipy.optimize import minimize as _minimize
-        alpha0 = 2.797
+    med_obs_c = np.median(grads_c, axis=0)
 
-        def _objective_2d(p):
-            log_A, al = p
-            grads_s = _simulate(10**log_A, al)
-            sim_diff = _cutout(grads_s, bfe_late_groups) - _cutout(grads_s, bfe_early_groups)
-            return np.sum((((sim_diff - obs_diff) / noise_diff)[fit_mask])**2)
+    # Normalisation: background-subtract each group and divide by its TOTAL
+    # observed PSF flux, so each group is a unit-flux PSF and the late-early
+    # difference is flux-conserving by construction (no pedestal, no arbitrary
+    # core aperture, no model dependence). The divisor is observed data
+    # (A-independent), so the model stays exactly linear in A.
+    _norm_ap = r_map_c <= (cut - 6)                       # encloses PSF + ring
+    _bg_ann = (r_map_c > (cut - 6)) & (r_map_c <= (cut - 1))
 
-        res = _minimize(_objective_2d, x0=[np.log10(1e-6), alpha0], method='Powell',
-                        options={'xtol': 1e-8, 'ftol': 1e-12, 'maxiter': 50000})
-        log_A_fit, alpha_fit = res.x
-        A_bfe_fit = 10**log_A_fit
+    def _cut2d(img):
+        return img[cy-cut:cy+cut+1, cx-cut:cx+cut+1]
+
+    def _starflux(img):
+        c = _cut2d(img)
+        return float((c - np.median(c[_bg_ann]))[_norm_ap].sum())
+    _fobs = np.array([_starflux(med_obs_c[g]) for g in range(n_grads)])
+
+    def _norm_diff(stack):
+        def _acc(glist):
+            s = 0.0
+            for g in glist:
+                c = _cut2d(stack[g])
+                s = s + (c - np.median(c[_bg_ann])) / _fobs[g]
+            return s / len(glist)
+        return _acc(bfe_late_groups) - _acc(bfe_early_groups)
+
+    from scipy.optimize import minimize as _minimize
+    _opt = dict(method='Powell',
+                options={'xtol': 1e-5, 'ftol': 1e-9, 'maxiter': 20000})
+
+    # fit radius from the initial (raw) maps; held fixed across iterations
+    true_grads, Q_grads = _build_true(rate_c, Adec_c, delta_c)
+    obs_diff = _norm_diff(med_obs_c)
+    noise_diff = np.std([_norm_diff(grads_c[i]) for i in range(n_int)], axis=0) / np.sqrt(n_int)
+    noise_diff = np.clip(noise_diff, noise_diff[noise_diff > 0].min() * 0.1, None)
+    if fit_r is None:
+        snr_profile = np.array([
+            np.mean(np.abs(obs_diff[np.round(r_map_c).astype(int) == ri])) /
+            np.mean(noise_diff[np.round(r_map_c).astype(int) == ri])
+            for ri in range(1, cut)])
+        above = np.where(snr_profile > 2.0)[0]
+        fit_r = max(5, int(above[-1]) + 1) if len(above) > 0 else 5
         if verbose:
-            print(f'  A_bfe = {A_bfe_fit:.4e}  alpha = {alpha_fit:.4f}  (both fitted)')
-    else:
-        def _objective(log_A):
-            grads_s = _simulate(10**log_A)
-            sim_diff = _cutout(grads_s, bfe_late_groups) - _cutout(grads_s, bfe_early_groups)
-            return np.sum((((sim_diff - obs_diff) / noise_diff)[fit_mask])**2)
+            print(f'  Auto fit_r = {fit_r} px (SNR-based)')
+    fit_mask = r_map_c <= fit_r
 
-        result = minimize_scalar(_objective, bounds=(-9, -4), method='bounded')
-        A_bfe_fit = 10**result.x
-        alpha_fit = alpha_bfe
+    def _fit_bfe_once(true_grads, Q_grads):
+        # Fit kernel shape (alpha, b, c) nonlinearly; A and a constant
+        # background are linear (solved by weighted least squares).
+        obs = _norm_diff(med_obs_c)
+        noise = np.std([_norm_diff(grads_c[i]) for i in range(n_int)], axis=0) / np.sqrt(n_int)
+        noise = np.clip(noise, noise[noise > 0].min() * 0.1, None)
+        D_true = _norm_diff(true_grads)
+        wfit = (1.0 / noise)[fit_mask]
+        obsfit = obs[fit_mask]; dtruefit = D_true[fit_mask]
+        onesfit = np.ones(int(fit_mask.sum()))
+
+        def deflection(al, b, c):
+            Kk = _make_kernel(al, b, c)
+            defl = np.zeros((n_grads, nyc, nxc))
+            for g in range(n_grads):
+                defl[g] = fftconvolve(Q_grads[g] * true_grads[g], Kk, mode='same')
+            return _norm_diff(defl)
+
+        def solve_AB(Ddefl):
+            Dd = Ddefl[fit_mask]
+            r0 = wfit * (dtruefit - obsfit)
+            M = np.column_stack([-wfit * Dd, wfit * onesfit])
+            x, *_ = np.linalg.lstsq(M, -r0, rcond=None)
+            return x[0], x[1], float(np.sum((r0 + M @ x)**2))
+
+        def chi2_shape(al, b, c):
+            if not (0.5 <= al <= 6.0 and -0.6 <= b <= 0.6 and -0.08 <= c <= 0.08):
+                return 1e30
+            Dd = deflection(al, b, c)
+            if not np.all(np.isfinite(Dd)):
+                return 1e30
+            return solve_AB(Dd)[2]
+
+        if alpha_bfe is None:
+            res = _minimize(lambda p: chi2_shape(p[0], p[1], p[2]),
+                            x0=[3.43, -0.4, 0.04], **_opt)
+            al, b, c = res.x
+        elif b_bfe is None or c_bfe is None:
+            res = _minimize(lambda p: chi2_shape(alpha_bfe, p[0], p[1]),
+                            x0=[-0.4, 0.04], **_opt)
+            al, b, c = alpha_bfe, res.x[0], res.x[1]
+        else:
+            al, b, c = alpha_bfe, b_bfe, c_bfe
+        A_, bg_, chi2_ = solve_AB(deflection(al, b, c))
+        sim = D_true - A_ * deflection(al, b, c) + bg_
+        return A_, al, b, c, bg_, chi2_, obs, D_true, sim
+
+    # Iterate RCD <-> BFE: the reset-decay maps (rate, Adec, delta) are refit
+    # from the BFE-removed gradient each pass, so the decay can no longer absorb
+    # the BFE ring. The two are coupled because BFE depends on the accumulated
+    # charge Q built from the reset-decay model, so this converges to the
+    # simultaneous solution without a full coupled nonlinear solve.
+    MAX_FIT_ITER, A_TOL = 12, 0.01
+    A_prev = None
+    for _it in range(MAX_FIT_ITER):
+        true_grads, Q_grads = _build_true(rate_c, Adec_c, delta_c)
+        (A_bfe_fit, alpha_fit, b_fit, c_fit, bg_fit, _chi2_fit,
+         obs_diff, D_true, sim_diff) = _fit_bfe_once(true_grads, Q_grads)
         if verbose:
-            print(f'  A_bfe = {A_bfe_fit:.4e}  (alpha fixed at {alpha_bfe})')
+            print(f'  [iter {_it}] A_bfe = {A_bfe_fit:.4e}  alpha = {alpha_fit:.4f}  '
+                  f'b = {b_fit:.4f}  c = {c_fit:.4f}  '
+                  f'chi2/n = {_chi2_fit/max(int(fit_mask.sum())-2, 1):.3f}')
+        # stop once A_bfe has stabilised (RCD/BFE split has converged)
+        if A_prev is not None and abs(A_bfe_fit - A_prev) <= A_TOL * abs(A_bfe_fit):
+            break
+        A_prev = A_bfe_fit
+        if _it == MAX_FIT_ITER - 1:
+            break
+        # remove BFE from the observed median gradient, refit RCD maps
+        Kk = _make_kernel(alpha_fit, b_fit, c_fit)
+        med_corr = np.empty_like(med_obs_c)
+        for g in range(n_grads):
+            med_corr[g] = med_obs_c[g] + A_bfe_fit * fftconvolve(
+                Q_grads[g] * true_grads[g], Kk, mode='same')
+        pc, _, _, _ = np.linalg.lstsq(X, med_corr.reshape(n_grads, -1), rcond=None)
+        rate_c = pc[0].reshape(nyc, nxc)
+        Adec_c = pc[1].reshape(nyc, nxc)
+        delta_c = pc[2].reshape(nyc, nxc)
 
     if diagnostics:
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
 
-        grads_best = _simulate(A_bfe_fit, alpha_fit)
-        sim_diff = (_cutout(grads_best, bfe_late_groups)
-                    - _cutout(grads_best, bfe_early_groups))
         res_diff = obs_diff - sim_diff
 
         rr = np.round(r_map_c).astype(int)
@@ -517,7 +598,8 @@ def fit_bfe_params(cube, alpha_bfe=2.797, bg_mask=None, sci_mask=None,
         fig, axes = plt.subplots(2, 2, figsize=(10, 8))
         for ax, img, title in [
             (axes[0, 0], obs_diff, 'Observed late$-$early'),
-            (axes[0, 1], sim_diff, f'Model (A={A_bfe_fit:.2e}, α={alpha_fit:.3f})'),
+            (axes[0, 1], sim_diff,
+             f'Model (A={A_bfe_fit:.2e}, α={alpha_fit:.2f}, b={b_fit:.2f}, c={c_fit:.3f})'),
             (axes[1, 0], res_diff, 'Residual (obs$-$model)'),
         ]:
             im = ax.imshow(img, origin='lower', cmap='RdBu_r',
@@ -547,12 +629,16 @@ def fit_bfe_params(cube, alpha_bfe=2.797, bg_mask=None, sci_mask=None,
         if verbose:
             print(f'  Saved BFE fit diagnostics to {save_path}')
 
-    if alpha_bfe is None:
-        return A_bfe_fit, alpha_fit, sx, sy
-    return A_bfe_fit, sx, sy
+    if return_model:
+        model = dict(obs=obs_diff, model=sim_diff, r_map=r_map_c,
+                     A=A_bfe_fit, alpha=alpha_fit, b=b_fit, c=c_fit,
+                     bg=bg_fit, chi2_n=_chi2_fit / max(int(fit_mask.sum()) - 2, 1),
+                     cy=cy, cx=cx, cut=cut)
+        return A_bfe_fit, alpha_fit, b_fit, c_fit, sx, sy, model
+    return A_bfe_fit, alpha_fit, b_fit, c_fit, sx, sy
 
 
-def correct_bfe_rcd(cube, A_bfe=1.035e-6, alpha_bfe=2.797,
+def correct_bfe_rcd(cube, A_bfe=1.035e-6, alpha_bfe=3.43, b_bfe=-0.50, c_bfe=0.056,
                     bg_mask=None, late_groups=None, verbose=False,
                     fit_bfe=False, sci_mask=None,
                     bfe_early_groups=None, bfe_late_groups=None,
@@ -583,7 +669,13 @@ def correct_bfe_rcd(cube, A_bfe=1.035e-6, alpha_bfe=2.797,
     A_bfe : float
         BFE kernel amplitude (default 1.035e-6).
     alpha_bfe : float
-        BFE kernel power-law index (default 2.783).
+        BFE kernel power-law index (default 3.43, bright-star consensus).
+    b_bfe, c_bfe : float
+        Quadratic-numerator coefficients of the kernel
+        K = -(1 + b r + c r^2) / r^alpha (centre = -(off-centre sum), so
+        sum(K)=0). Defaults (b=-0.50, c=0.056) are the bright-star consensus
+        kernel; b=c=0 reduces K to the bare power law. When fit_bfe=True these
+        are overwritten by the fitted values.
     bg_mask : ndarray (ny, nx) bool, optional
         True = background pixels used to fit the global RCD timescale tau.
         If None, all pixels are used.
@@ -639,15 +731,17 @@ def correct_bfe_rcd(cube, A_bfe=1.035e-6, alpha_bfe=2.797,
             bg_mask=bg_mask, sci_mask=sci_mask,
             bfe_early_groups=bfe_early_groups, bfe_late_groups=bfe_late_groups,
             ap_radius=ap_radius, cut=cut, fit_r=fit_r, verbose=verbose)
-        A_bfe_fit, _sx, _sy = fit_result
+        A_bfe_fit, alpha_fit, b_fit, c_fit, _sx, _sy = fit_result
         if A_bfe_fit is None:
             if verbose:
                 print('No source meets brightness threshold — skipping BFE correction')
             A_bfe = 0.0
         else:
             A_bfe = A_bfe_fit
+            alpha_bfe, b_bfe, c_bfe = alpha_fit, b_fit, c_fit
             if verbose:
-                print(f'Using fitted A_bfe={A_bfe:.4e} at x={_sx}, y={_sy}')
+                print(f'Using fitted A_bfe={A_bfe:.4e}  alpha={alpha_bfe:.3f}  '
+                      f'b={b_bfe:.3f}  c={c_bfe:.4f} at x={_sx}, y={_sy}')
 
     # Step 1: causal iterative BFE correction — flux conserving
     # Forward model: grad_obs = true_grad - A * K ⊛ (Q * true_grad)
@@ -658,7 +752,7 @@ def correct_bfe_rcd(cube, A_bfe=1.035e-6, alpha_bfe=2.797,
     ii, jj = np.mgrid[-kh:kh+1, -kh:kh+1].astype(float)
     r = np.sqrt(ii**2 + jj**2)
     with np.errstate(divide='ignore', invalid='ignore'):
-        K = np.where(r > 0, -1.0 / r**alpha_bfe, 0.0)
+        K = np.where(r > 0, -(1.0 + b_bfe * r + c_bfe * r**2) / r**alpha_bfe, 0.0)
     K[kh, kh] = -K.sum()
 
     grads_bfe = grads_raw.copy()
