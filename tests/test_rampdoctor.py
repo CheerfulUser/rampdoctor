@@ -161,12 +161,20 @@ class TestFitBFE:
         pytest.importorskip('sep')
         A_true = 1e-6
         cube = make_bfe_cube(A_bfe=A_true)
-        rd = RampDoctor(cube=cube)
+        rd = RampDoctor(cube=cube, method='kernel')   # kernel-injected cube
         A_fit = rd.fit_bfe()
         assert A_fit is not None
         assert 0.3 < A_fit / A_true < 3.0
         assert abs(rd.star_x - 60) <= 1
         assert abs(rd.star_y - 60) <= 1
+
+    def test_migration_fit_runs(self):
+        pytest.importorskip('sep')
+        cube = make_bfe_cube(A_bfe=1e-6)
+        rd = RampDoctor(cube=cube, method='migration')
+        M = rd.fit_bfe()
+        assert M is not None and M > 0
+        assert abs(rd.star_x - 60) <= 1 and abs(rd.star_y - 60) <= 1
 
     def test_faint_field_returns_none(self):
         pytest.importorskip('sep')
@@ -182,6 +190,6 @@ class TestFitBFE:
         pytest.importorskip('sep')
         pytest.importorskip('matplotlib')
         out = tmp_path / 'bfe_diag.png'
-        rd = RampDoctor(cube=make_bfe_cube())
+        rd = RampDoctor(cube=make_bfe_cube(), method='kernel')
         rd.fit_bfe(diagnostics=True, save_path=out)
         assert out.exists()

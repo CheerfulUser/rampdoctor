@@ -2,7 +2,8 @@ import numpy as np
 from pathlib import Path
 
 from .ramp_correction import (build_correction_map, correct_reset_decay,
-                              fit_bfe_params, correct_bfe_rcd, correct_ramp)
+                              fit_bfe_params, fit_migration_params,
+                              correct_bfe_rcd, correct_ramp)
 
 
 class RampDoctor:
@@ -43,7 +44,8 @@ class RampDoctor:
     >>> cube_cor = rd.correct()
     """
 
-    def __init__(self, cube=None, file=None, dq=None, A_bfe=1.035e-6,
+    def __init__(self, cube=None, file=None, dq=None, method='migration',
+                 M_mig=1.0e-6, thr_mig=50.0, A_bfe=1.035e-6,
                  alpha_bfe=3.43, b_bfe=-0.50, c_bfe=0.056,
                  bg_mask=None, sci_mask=None, verbose=False):
         self.file = Path(file) if file is not None else None
@@ -60,6 +62,9 @@ class RampDoctor:
         if self.cube.ndim != 4:
             raise ValueError('cube must have shape (n_int, n_groups, ny, nx).')
         self.dq = dq
+        self.method = method
+        self.M_mig = M_mig
+        self.thr_mig = thr_mig
         self.A_bfe = A_bfe
         self.alpha_bfe = alpha_bfe
         self.b_bfe = b_bfe
@@ -92,19 +97,29 @@ class RampDoctor:
                 bfe_late_groups=None, ap_radius=5, cut=20, fit_r=None,
                 diagnostics=False, save_path=None):
         """
-        Fit the BFE amplitude (and optionally alpha) from the brightest
-        source. Results are stored on self and used by correct().
-
-        Set diagnostics=True to save a figure of the observed and model
-        PSF differences, the residual, and radial profiles
-        (default 'bfe_fit_diagnostics.png').
+        Fit the BFE parameters from the brightest source, using the configured
+        ``method``. For method='migration' this fits the migration strength M
+        and force threshold; for method='kernel' the kernel amplitude (and
+        optionally alpha). Results are stored on self and used by correct().
 
         Returns
         -------
-        A_bfe : float or None
-            Fitted amplitude, or None if no source met the brightness
-            threshold (in which case stored parameters are unchanged).
+        float or None
+            The fitted amplitude (kernel) or migration strength M, or None if
+            no source met the brightness threshold.
         """
+        if self.method == 'migration':
+            M, thr, sx, sy = fit_migration_params(
+                self.cube, M_init=self.M_mig, thr_init=self.thr_mig,
+                bg_mask=self.bg_mask, sci_mask=self.sci_mask,
+                bfe_early_groups=bfe_early_groups, bfe_late_groups=bfe_late_groups,
+                ap_radius=ap_radius, cut=cut, fit_r=fit_r, verbose=self.verbose)
+            if M is None:
+                return None
+            self.M_mig, self.thr_mig = M, thr
+            self.star_x, self.star_y = sx, sy
+            return M
+
         alpha = None if fit_alpha else self.alpha_bfe
         result = fit_bfe_params(
             self.cube, alpha_bfe=alpha, bg_mask=self.bg_mask,
@@ -156,7 +171,9 @@ class RampDoctor:
         if fit_bfe:
             self.fit_bfe(diagnostics=diagnostics)
         self.cube_cor = correct_bfe_rcd(
-            self.cube, A_bfe=self.A_bfe, alpha_bfe=self.alpha_bfe,
+            self.cube, method=self.method,
+            M_mig=self.M_mig, thr_mig=self.thr_mig,
+            A_bfe=self.A_bfe, alpha_bfe=self.alpha_bfe,
             b_bfe=self.b_bfe, c_bfe=self.c_bfe,
             bg_mask=self.bg_mask, late_groups=late_groups,
             sci_mask=self.sci_mask, verbose=self.verbose,

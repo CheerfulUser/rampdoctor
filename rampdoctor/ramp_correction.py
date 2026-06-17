@@ -638,7 +638,222 @@ def fit_bfe_params(cube, alpha_bfe=3.43, b_bfe=None, c_bfe=None,
     return A_bfe_fit, alpha_fit, b_fit, c_fit, sx, sy
 
 
-def correct_bfe_rcd(cube, A_bfe=1.035e-6, alpha_bfe=3.43, b_bfe=-0.50, c_bfe=0.056,
+# ===========================================================================
+# Charge-migration BFE model (the default correction method).
+#
+# Physical picture: accumulated charge migrates out of high-charge pixels,
+# flowing down its own gradient with a charge-weighted mobility (bright cores
+# diffuse faster), as a conserved flux. A force threshold suppresses migration
+# below a gradient barrier. The per-pixel update is a charge-weighted discrete
+# Laplacian of the image; total charge is conserved exactly.
+# ===========================================================================
+def _mig_step(Q, k, thr):
+    """One conserved migration tick: charge flows down-gradient between adjacent
+    pixels with mobility proportional to the face-averaged charge."""
+    out = Q.copy()
+    for axis in (0, 1):
+        Ql = np.swapaxes(Q, 0, axis)
+        dQ = Ql[:-1] - Ql[1:]
+        D = 0.5 * (Ql[:-1] + Ql[1:])
+        if thr > 0:
+            dQ = np.sign(dQ) * np.maximum(np.abs(dQ) - thr, 0.0)
+        f = k * D * dQ
+        o = np.swapaxes(out, 0, axis)
+        o[:-1] -= f
+        o[1:] += f
+    return out
+
+
+def _mig_group(Q, M, thr):
+    """Apply a total migration M over one group, adaptively sub-stepped so each
+    tick is numerically stable (CFL k*Qmax < 0.2)."""
+    qmax = Q.max()
+    if qmax <= 0 or M <= 0:
+        return Q
+    n_sub = max(1, int(np.ceil(M * qmax / 0.2)))
+    k = M / n_sub
+    for _ in range(min(n_sub, 600)):
+        Q = _mig_step(Q, k, thr)
+    return Q
+
+
+def _mig_forward(true_grads, M, thr):
+    """Forward model: accumulate true gradients group by group, migrating the
+    accumulated charge between readouts; return the observed gradients (readout
+    differences)."""
+    n_g = true_grads.shape[0]
+    Q = np.zeros(true_grads.shape[1:])
+    Qprev = Q.copy()
+    out = np.zeros_like(true_grads)
+    for g in range(n_g):
+        Q = _mig_group(Q + true_grads[g], M, thr)
+        out[g] = Q - Qprev
+        Qprev = Q.copy()
+    return out
+
+
+def _mig_invert(med_obs, M, thr, n_born=4):
+    """Recover the migration-free (true) gradients from observed median
+    gradients by a Born-style fixed-point iteration on the full ramp."""
+    true_grads = med_obs.copy()
+    for _ in range(n_born):
+        pred = _mig_forward(true_grads, M, thr)
+        true_grads = true_grads + (med_obs - pred)
+    return true_grads
+
+
+def fit_migration_params(cube, M_init=1.0e-6, thr_init=50.0, bg_mask=None,
+                         sci_mask=None, bfe_early_groups=None, bfe_late_groups=None,
+                         ap_radius=5, cut=20, fit_r=None, verbose=False,
+                         max_iter=6, M_tol=0.02):
+    """Fit the charge-migration BFE parameters (migration strength M and force
+    threshold) from the brightest source. Uses an iterative reset-decay <->
+    migration fit so the decay cannot absorb the BFE.
+
+    Returns (M, thr, sx, sy); M is None if no source meets the threshold.
+    """
+    import sep
+    from scipy.optimize import minimize as _minimize
+
+    cube = np.asarray(cube, dtype=float)
+    n_int, n_groups, ny, nx = cube.shape
+    n_grads = n_groups - 2
+    g_arr = np.arange(n_grads, dtype=float)
+    grads = np.diff(cube, axis=1)[:, :n_grads]
+    med = np.median(grads, axis=0)
+
+    detect = np.median(grads[:, 1:n_grads], axis=(0, 1)).astype(np.float64)
+    sep_mask = (~sci_mask.astype(bool)) if sci_mask is not None else None
+    bkg = sep.Background(detect, mask=sep_mask)
+    obj = sep.extract((detect - bkg.back()).astype(np.float64), 5.0,
+                      err=bkg.globalrms, mask=sep_mask)
+    edge = 25
+    obj = obj[(obj['x'] > edge) & (obj['x'] < nx-edge) & (obj['y'] > edge) &
+              (obj['y'] < ny-edge) & (obj['a']/obj['b'] < 3)]
+    if len(obj) == 0 or obj[np.argmax(obj['flux'])]['flux'] < 50000:
+        if verbose:
+            print('  No source meets brightness threshold — skipping migration fit')
+        return None, thr_init, nx//2, ny//2
+    star = obj[np.argmax(obj['flux'])]
+    sy, sx = int(round(star['y'])), int(round(star['x']))
+
+    yy, xx = np.mgrid[:ny, :nx]
+    rs = np.sqrt((yy-sy)**2 + (xx-sx)**2)
+    _bg = bg_mask.astype(bool) if bg_mask is not None else (rs > 15) & (rs < min(ny, nx)//3)
+    if sci_mask is not None and bg_mask is None:
+        _bg &= sci_mask.astype(bool)
+    mb = np.nanmean(med[1:][:, _bg], axis=1)
+    popt, _ = curve_fit(lambda g, C, A, t: C+A*np.exp(-g/t), g_arr[1:], mb,
+                        p0=[mb[-1], mb[0]-mb[-1], 1.5])
+    tau = float(popt[2])
+    exp_g = np.exp(-g_arr/tau)
+    ff = np.zeros(n_grads); ff[0] = -1.0
+    Xb = np.column_stack([np.ones(n_grads), exp_g, ff])
+    p, _, _, _ = np.linalg.lstsq(Xb, med.reshape(n_grads, -1), rcond=None)
+    rate, Adec, delta = (p[i].reshape(ny, nx) for i in range(3))
+
+    crop = cut + 50
+    y0, y1 = max(0, sy-crop), min(ny, sy+crop+1)
+    x0, x1 = max(0, sx-crop), min(nx, sx+crop+1)
+    cy, cx = sy-y0, sx-x0
+    rate_c, Adec_c, delta_c = (m[y0:y1, x0:x1] for m in (rate, Adec, delta))
+    gc = grads[:, :, y0:y1, x0:x1]
+    med_obs_c = np.median(gc, axis=0)
+    nyc, nxc = rate_c.shape
+
+    if bfe_early_groups is None:
+        n_e = max(2, min(3, n_grads // 4)); start = 1 if n_grads < 8 else 2
+        bfe_early_groups = list(range(start, start + n_e))
+    if bfe_late_groups is None:
+        n_e = max(2, min(3, n_grads // 4))
+        bfe_late_groups = list(range(n_grads - n_e, n_grads))
+
+    yy_c, xx_c = np.mgrid[:2*cut+1, :2*cut+1]
+    rmap = np.sqrt((yy_c-cut)**2 + (xx_c-cut)**2)
+    norm_ap = rmap <= (cut-6)
+    bg_ann = (rmap > (cut-6)) & (rmap <= (cut-1))
+
+    def _cut(img):
+        return img[cy-cut:cy+cut+1, cx-cut:cx+cut+1]
+
+    def norm_diff(stack):
+        def acc(gl):
+            s = 0.0
+            for g in gl:
+                c = _cut(stack[g])
+                c = c - np.median(c[bg_ann])
+                s = s + c / c[norm_ap].sum()
+            return s / len(gl)
+        return acc(bfe_late_groups) - acc(bfe_early_groups)
+
+    obs = norm_diff(med_obs_c)
+    noise = np.std([norm_diff(gc[i]) for i in range(n_int)], axis=0) / np.sqrt(n_int)
+    noise = np.clip(noise, np.nanpercentile(noise[noise > 0], 5), None)
+    if fit_r is None:
+        snr = np.array([np.mean(np.abs(obs[np.round(rmap).astype(int) == ri])) /
+                        np.mean(noise[np.round(rmap).astype(int) == ri])
+                        for ri in range(1, cut)])
+        above = np.where(snr > 2.0)[0]
+        fit_r = max(8, int(above[-1]) + 1) if len(above) > 0 else 8
+    fitmask = rmap <= fit_r
+    w = 1.0 / noise
+
+    def model_diff(M, thr, rate_c, Adec_c, delta_c):
+        Q = np.zeros((nyc, nxc)); Qprev = Q.copy()
+        out = np.zeros((n_grads, nyc, nxc))
+        for g in range(n_grads):
+            Q = _mig_group(Q + rate_c, M, thr)
+            photo = Q - Qprev; Qprev = Q.copy()
+            tg = photo + Adec_c * exp_g[g]
+            if g == 0:
+                tg = tg - delta_c
+            out[g] = tg
+        return norm_diff(out)
+
+    logM0, thr0 = np.log10(M_init), thr_init
+    M_prev = None
+    for _it in range(max_iter):
+        def chi2(par):
+            logM, thr = par
+            if not (-9 <= logM <= -2 and 0 <= thr <= 5000):
+                return 1e30
+            d = model_diff(10**logM, thr, rate_c, Adec_c, delta_c)
+            if not np.all(np.isfinite(d)):
+                return 1e30
+            return float(np.sum((((d - obs) * w)[fitmask])**2))
+
+        res = _minimize(chi2, [logM0, thr0], method='Powell',
+                        options={'xtol': 1e-4, 'ftol': 1e-7, 'maxiter': 1500})
+        M_fit, thr_fit = 10**res.x[0], max(0.0, res.x[1])
+        logM0, thr0 = res.x[0], thr_fit
+        if verbose:
+            print(f'  [iter {_it}] M={M_fit:.4e}  thr={thr_fit:.1f} DN  '
+                  f'chi2/n={res.fun/max(int(fitmask.sum())-2, 1):.3f}')
+        if M_prev is not None and abs(M_fit - M_prev) <= M_tol*abs(M_fit):
+            break
+        M_prev = M_fit
+        if _it == max_iter - 1:
+            break
+        # remove migration, refit reset-decay on the de-migrated gradient
+        Q = np.zeros((nyc, nxc)); Qprev = Q.copy()
+        photo = np.zeros((n_grads, nyc, nxc))
+        for g in range(n_grads):
+            Q = _mig_group(Q + rate_c, M_fit, thr_fit)
+            photo[g] = Q - Qprev; Qprev = Q.copy()
+        med_corr = med_obs_c - (photo - rate_c[None])
+        pc, _, _, _ = np.linalg.lstsq(Xb, med_corr.reshape(n_grads, -1), rcond=None)
+        rate_c = pc[0].reshape(nyc, nxc)
+        Adec_c = pc[1].reshape(nyc, nxc)
+        delta_c = pc[2].reshape(nyc, nxc)
+
+    if verbose:
+        print(f'  M = {M_fit:.4e}  threshold = {thr_fit:.1f} DN  at x={sx}, y={sy}')
+    return M_fit, thr_fit, sx, sy
+
+
+def correct_bfe_rcd(cube, method='migration',
+                    M_mig=1.0e-6, thr_mig=50.0,
+                    A_bfe=1.035e-6, alpha_bfe=3.43, b_bfe=-0.50, c_bfe=0.056,
                     bg_mask=None, late_groups=None, verbose=False,
                     fit_bfe=False, sci_mask=None,
                     bfe_early_groups=None, bfe_late_groups=None,
@@ -648,8 +863,7 @@ def correct_bfe_rcd(cube, A_bfe=1.035e-6, alpha_bfe=3.43, b_bfe=-0.50, c_bfe=0.0
     Joint BFE + reset-decay correction for MIRI ramp data.
 
     Three sequential steps applied to gradients:
-      1. Causal BFE inversion: each gradient is divided by (1 - A_bfe * K⊛Q)
-         where Q is the accumulated charge from all previous groups.
+      1. Causal BFE inversion (method-dependent, see ``method``).
       2. Parametric RCD subtraction: fit C + A*exp(-g/tau) with tau global
          (from background pixels) and [A, C, delta] per pixel via lstsq.
          Subtract the fitted decay from every integration.
@@ -666,8 +880,19 @@ def correct_bfe_rcd(cube, A_bfe=1.035e-6, alpha_bfe=3.43, b_bfe=-0.50, c_bfe=0.0
     ----------
     cube : ndarray (n_int, n_groups, ny, nx), float
         Raw SCI data from uncal.fits.
+    method : {'migration', 'kernel'}
+        BFE model for step 1. 'migration' (default) uses the charge-migration
+        model: accumulated charge diffuses out of high-charge pixels with a
+        charge-weighted mobility and a force threshold (parameters M_mig,
+        thr_mig), inverted by a Born-style fixed point. 'kernel' uses the
+        source-centric flux-conserving kernel K = -(1 + b r + c r^2)/r^alpha
+        (parameters A_bfe, alpha_bfe, b_bfe, c_bfe). Both conserve charge.
+    M_mig : float
+        Migration strength per group (used when method='migration').
+    thr_mig : float
+        Migration force threshold in DN (used when method='migration').
     A_bfe : float
-        BFE kernel amplitude (default 1.035e-6).
+        BFE kernel amplitude (used when method='kernel', default 1.035e-6).
     alpha_bfe : float
         BFE kernel power-law index (default 3.43, bright-star consensus).
     b_bfe, c_bfe : float
@@ -724,52 +949,81 @@ def correct_bfe_rcd(cube, A_bfe=1.035e-6, alpha_bfe=3.43, b_bfe=-0.50, c_bfe=0.0
         late_groups = list(range(n_grads - 3, n_grads))
 
     if fit_bfe:
-        if verbose:
-            print('Fitting A_bfe from brightest source...')
-        fit_result = fit_bfe_params(
-            cube, alpha_bfe=alpha_bfe,
-            bg_mask=bg_mask, sci_mask=sci_mask,
-            bfe_early_groups=bfe_early_groups, bfe_late_groups=bfe_late_groups,
-            ap_radius=ap_radius, cut=cut, fit_r=fit_r, verbose=verbose)
-        A_bfe_fit, alpha_fit, b_fit, c_fit, _sx, _sy = fit_result
-        if A_bfe_fit is None:
+        if method == 'migration':
             if verbose:
-                print('No source meets brightness threshold — skipping BFE correction')
-            A_bfe = 0.0
+                print('Fitting migration parameters from brightest source...')
+            M_fit, thr_fit, _sx, _sy = fit_migration_params(
+                cube, M_init=M_mig, thr_init=thr_mig, bg_mask=bg_mask,
+                sci_mask=sci_mask, bfe_early_groups=bfe_early_groups,
+                bfe_late_groups=bfe_late_groups, ap_radius=ap_radius, cut=cut,
+                fit_r=fit_r, verbose=verbose)
+            if M_fit is None:
+                if verbose:
+                    print('No source meets brightness threshold — skipping BFE correction')
+                M_mig = 0.0
+            else:
+                M_mig, thr_mig = M_fit, thr_fit
+                if verbose:
+                    print(f'Using fitted M={M_mig:.4e}  threshold={thr_mig:.1f} DN '
+                          f'at x={_sx}, y={_sy}')
         else:
-            A_bfe = A_bfe_fit
-            alpha_bfe, b_bfe, c_bfe = alpha_fit, b_fit, c_fit
             if verbose:
-                print(f'Using fitted A_bfe={A_bfe:.4e}  alpha={alpha_bfe:.3f}  '
-                      f'b={b_bfe:.3f}  c={c_bfe:.4f} at x={_sx}, y={_sy}')
+                print('Fitting A_bfe from brightest source...')
+            fit_result = fit_bfe_params(
+                cube, alpha_bfe=alpha_bfe,
+                bg_mask=bg_mask, sci_mask=sci_mask,
+                bfe_early_groups=bfe_early_groups, bfe_late_groups=bfe_late_groups,
+                ap_radius=ap_radius, cut=cut, fit_r=fit_r, verbose=verbose)
+            A_bfe_fit, alpha_fit, b_fit, c_fit, _sx, _sy = fit_result
+            if A_bfe_fit is None:
+                if verbose:
+                    print('No source meets brightness threshold — skipping BFE correction')
+                A_bfe = 0.0
+            else:
+                A_bfe = A_bfe_fit
+                alpha_bfe, b_bfe, c_bfe = alpha_fit, b_fit, c_fit
+                if verbose:
+                    print(f'Using fitted A_bfe={A_bfe:.4e}  alpha={alpha_bfe:.3f}  '
+                          f'b={b_bfe:.3f}  c={c_bfe:.4f} at x={_sx}, y={_sy}')
 
-    # Step 1: causal iterative BFE correction — flux conserving
-    # Forward model: grad_obs = true_grad - A * K ⊛ (Q * true_grad)
-    # Iterative inversion: true_grad^(n+1) = grad_obs + A * K ⊛ (Q * true_grad^(n))
-    # Since K sums to zero, K̂(0)=0 → total image flux is exactly conserved.
-    N_ITER = 3
-    kh = 20
-    ii, jj = np.mgrid[-kh:kh+1, -kh:kh+1].astype(float)
-    r = np.sqrt(ii**2 + jj**2)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        K = np.where(r > 0, -(1.0 + b_bfe * r + c_bfe * r**2) / r**alpha_bfe, 0.0)
-    K[kh, kh] = -K.sum()
-
-    grads_bfe = grads_raw.copy()
-    Q_med = np.zeros((ny, nx))
-    for g in range(n_grads_all):
-        if g > 0:
-            Q_med = Q_med + np.median(grads_bfe[:, g-1], axis=0)
-        med_obs_g = np.median(grads_raw[:, g], axis=0)
-        true_grad_est = med_obs_g.copy()
-        for _ in range(N_ITER):
-            true_grad_est = med_obs_g + A_bfe * fftconvolve(Q_med * true_grad_est, K, mode='same')
-        KQg = fftconvolve(Q_med * true_grad_est, K, mode='same')
-        grads_bfe[:, g] = grads_raw[:, g] + A_bfe * KQg[None]
+    # Step 1: BFE inversion (method-dependent), flux conserving.
+    if method == 'migration':
+        # Charge-migration inversion: recover the migration-free gradients with
+        # a Born-style fixed point on the median ramp, then apply the per-group
+        # correction to every integration. Charge is conserved by construction.
+        med_obs = np.median(grads_raw[:, :n_grads_all], axis=0)
+        grads_bfe = grads_raw.copy()
+        if M_mig and M_mig > 0:
+            if verbose:
+                print('  migration inversion...')
+            true_grads = _mig_invert(med_obs, M_mig, thr_mig)
+            for g in range(n_grads_all):
+                grads_bfe[:, g] = grads_raw[:, g] + (true_grads[g] - med_obs[g])[None]
+    else:
+        # Kernel Born inversion: grad_obs = true - A * K ⊛ (Q * true). K sums to
+        # zero, so total image flux is exactly conserved.
+        N_ITER = 3
+        kh = 20
+        ii, jj = np.mgrid[-kh:kh+1, -kh:kh+1].astype(float)
+        r = np.sqrt(ii**2 + jj**2)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            K = np.where(r > 0, -(1.0 + b_bfe * r + c_bfe * r**2) / r**alpha_bfe, 0.0)
+        K[kh, kh] = -K.sum()
+        grads_bfe = grads_raw.copy()
+        Q_med = np.zeros((ny, nx))
+        for g in range(n_grads_all):
+            if g > 0:
+                Q_med = Q_med + np.median(grads_bfe[:, g-1], axis=0)
+            med_obs_g = np.median(grads_raw[:, g], axis=0)
+            true_grad_est = med_obs_g.copy()
+            for _ in range(N_ITER):
+                true_grad_est = med_obs_g + A_bfe * fftconvolve(Q_med * true_grad_est, K, mode='same')
+            KQg = fftconvolve(Q_med * true_grad_est, K, mode='same')
+            grads_bfe[:, g] = grads_raw[:, g] + A_bfe * KQg[None]
+            if verbose:
+                print(f'  BFE g={g}', end='\r')
         if verbose:
-            print(f'  BFE g={g}', end='\r')
-    if verbose:
-        print()
+            print()
 
     # Step 2: fit global tau from BFE-corrected background, excluding g=0
     med_bfe = np.median(grads_bfe[:, :n_grads], axis=0)   # (n_grads, ny, nx)
