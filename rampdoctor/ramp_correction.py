@@ -647,11 +647,17 @@ def fit_bfe_params(cube, alpha_bfe=3.43, b_bfe=None, c_bfe=None,
 # below a gradient barrier. The per-pixel update is a charge-weighted discrete
 # Laplacian of the image; total charge is conserved exactly.
 # ===========================================================================
-def _mig_step(Q, k, thr):
-    """One conserved migration tick: charge flows down-gradient between adjacent
-    pixels with mobility proportional to the face-averaged charge."""
+def _mig_step(Q, kx, ky, thr):
+    """One conserved migration tick along cardinal axes only (no diagonal).
+
+    Charge flows down-gradient between edge-sharing neighbours with mobility
+    proportional to the face-averaged charge. Both axes are computed from the
+    same Q so the update is simultaneous and exactly cardinal (diagonal pixels
+    receive zero flux by construction)."""
     out = Q.copy()
-    for axis in (0, 1):
+    for axis, k in ((0, ky), (1, kx)):
+        if k <= 0:
+            continue
         Ql = np.swapaxes(Q, 0, axis)
         dQ = Ql[:-1] - Ql[1:]
         D = 0.5 * (Ql[:-1] + Ql[1:])
@@ -664,20 +670,22 @@ def _mig_step(Q, k, thr):
     return out
 
 
-def _mig_group(Q, M, thr):
-    """Apply a total migration M over one group, adaptively sub-stepped so each
-    tick is numerically stable (CFL k*Qmax < 0.2)."""
+def _mig_group(Q, Mx, My, thr):
+    """Apply anisotropic cardinal migration (Mx in x, My in y) over one group.
+
+    Sub-stepped for CFL stability using the larger of Mx, My."""
     qmax = Q.max()
-    if qmax <= 0 or M <= 0:
+    if qmax <= 0 or (Mx <= 0 and My <= 0):
         return Q
-    n_sub = max(1, int(np.ceil(M * qmax / 0.2)))
-    k = M / n_sub
+    n_sub = max(1, int(np.ceil(max(Mx, My) * qmax / 0.2)))
+    kx = Mx / n_sub
+    ky = My / n_sub
     for _ in range(min(n_sub, 600)):
-        Q = _mig_step(Q, k, thr)
+        Q = _mig_step(Q, kx, ky, thr)
     return Q
 
 
-def _mig_forward(true_grads, M, thr):
+def _mig_forward(true_grads, Mx, My, thr):
     """Forward model: accumulate true gradients group by group, migrating the
     accumulated charge between readouts; return the observed gradients (readout
     differences)."""
@@ -686,18 +694,18 @@ def _mig_forward(true_grads, M, thr):
     Qprev = Q.copy()
     out = np.zeros_like(true_grads)
     for g in range(n_g):
-        Q = _mig_group(Q + true_grads[g], M, thr)
+        Q = _mig_group(Q + true_grads[g], Mx, My, thr)
         out[g] = Q - Qprev
         Qprev = Q.copy()
     return out
 
 
-def _mig_invert(med_obs, M, thr, n_born=4):
+def _mig_invert(med_obs, Mx, My, thr, n_born=4):
     """Recover the migration-free (true) gradients from observed median
     gradients by a Born-style fixed-point iteration on the full ramp."""
     true_grads = med_obs.copy()
     for _ in range(n_born):
-        pred = _mig_forward(true_grads, M, thr)
+        pred = _mig_forward(true_grads, Mx, My, thr)
         true_grads = true_grads + (med_obs - pred)
     return true_grads
 
@@ -705,12 +713,16 @@ def _mig_invert(med_obs, M, thr, n_born=4):
 def fit_migration_params(cube, M_init=1.0e-6, thr_init=50.0, bg_mask=None,
                          sci_mask=None, bfe_early_groups=None, bfe_late_groups=None,
                          ap_radius=5, cut=20, fit_r=None, verbose=False,
-                         max_iter=6, M_tol=0.02):
-    """Fit the charge-migration BFE parameters (migration strength M and force
-    threshold) from the brightest source. Uses an iterative reset-decay <->
-    migration fit so the decay cannot absorb the BFE.
+                         max_iter=6, M_tol=0.02, aniso=False,
+                         diagnostics=False, save_path=None):
+    """Fit the charge-migration BFE parameters from the brightest source.
 
-    Returns (M, thr, sx, sy); M is None if no source meets the threshold.
+    When aniso=False (default) fits a single isotropic migration strength M.
+    When aniso=True fits separate Mx (x-axis) and My (y-axis) strengths.
+    Uses an iterative RCD <-> migration fit so decay cannot absorb the BFE.
+
+    Returns (Mx, My, thr, sx, sy); Mx is None if no source meets threshold.
+    For the isotropic case Mx == My.
     """
     import sep
     from scipy.optimize import minimize as _minimize
@@ -798,11 +810,11 @@ def fit_migration_params(cube, M_init=1.0e-6, thr_init=50.0, bg_mask=None,
     fitmask = rmap <= fit_r
     w = 1.0 / noise
 
-    def model_diff(M, thr, rate_c, Adec_c, delta_c):
+    def model_diff(Mx, My, thr, rate_c, Adec_c, delta_c):
         Q = np.zeros((nyc, nxc)); Qprev = Q.copy()
         out = np.zeros((n_grads, nyc, nxc))
         for g in range(n_grads):
-            Q = _mig_group(Q + rate_c, M, thr)
+            Q = _mig_group(Q + rate_c, Mx, My, thr)
             photo = Q - Qprev; Qprev = Q.copy()
             tg = photo + Adec_c * exp_g[g]
             if g == 0:
@@ -811,34 +823,60 @@ def fit_migration_params(cube, M_init=1.0e-6, thr_init=50.0, bg_mask=None,
         return norm_diff(out)
 
     logM0, thr0 = np.log10(M_init), thr_init
+    Mx_fit = My_fit = M_init
     M_prev = None
-    for _it in range(max_iter):
-        def chi2(par):
-            logM, thr = par
-            if not (-9 <= logM <= -2 and 0 <= thr <= 5000):
-                return 1e30
-            d = model_diff(10**logM, thr, rate_c, Adec_c, delta_c)
-            if not np.all(np.isfinite(d)):
-                return 1e30
-            return float(np.sum((((d - obs) * w)[fitmask])**2))
 
-        res = _minimize(chi2, [logM0, thr0], method='Powell',
-                        options={'xtol': 1e-4, 'ftol': 1e-7, 'maxiter': 1500})
-        M_fit, thr_fit = 10**res.x[0], max(0.0, res.x[1])
-        logM0, thr0 = res.x[0], thr_fit
-        if verbose:
-            print(f'  [iter {_it}] M={M_fit:.4e}  thr={thr_fit:.1f} DN  '
-                  f'chi2/n={res.fun/max(int(fitmask.sum())-2, 1):.3f}')
-        if M_prev is not None and abs(M_fit - M_prev) <= M_tol*abs(M_fit):
+    for _it in range(max_iter):
+        if aniso:
+            def chi2(par):
+                logMx, logMy, thr = par
+                if not (-9 <= logMx <= -2 and -9 <= logMy <= -2 and 0 <= thr <= 5000):
+                    return 1e30
+                d = model_diff(10**logMx, 10**logMy, thr, rate_c, Adec_c, delta_c)
+                if not np.all(np.isfinite(d)):
+                    return 1e30
+                return float(np.sum((((d - obs) * w)[fitmask])**2))
+            x0 = [logM0, logM0, thr0]
+            res = _minimize(chi2, x0, method='Powell',
+                            options={'xtol': 1e-4, 'ftol': 1e-7, 'maxiter': 2000})
+            Mx_fit = 10**res.x[0]
+            My_fit = 10**res.x[1]
+            thr_fit = max(0.0, res.x[2])
+            logM0 = (res.x[0] + res.x[1]) / 2
+            thr0 = thr_fit
+            M_now = (Mx_fit + My_fit) / 2
+            if verbose:
+                print(f'  [iter {_it}] Mx={Mx_fit:.4e}  My={My_fit:.4e}  '
+                      f'thr={thr_fit:.1f} DN  chi2/n={res.fun/max(int(fitmask.sum())-3, 1):.3f}')
+        else:
+            def chi2(par):
+                logM, thr = par
+                if not (-9 <= logM <= -2 and 0 <= thr <= 5000):
+                    return 1e30
+                d = model_diff(10**logM, 10**logM, thr, rate_c, Adec_c, delta_c)
+                if not np.all(np.isfinite(d)):
+                    return 1e30
+                return float(np.sum((((d - obs) * w)[fitmask])**2))
+            res = _minimize(chi2, [logM0, thr0], method='Powell',
+                            options={'xtol': 1e-4, 'ftol': 1e-7, 'maxiter': 1500})
+            Mx_fit = My_fit = 10**res.x[0]
+            thr_fit = max(0.0, res.x[1])
+            logM0, thr0 = res.x[0], thr_fit
+            M_now = Mx_fit
+            if verbose:
+                print(f'  [iter {_it}] M={Mx_fit:.4e}  thr={thr_fit:.1f} DN  '
+                      f'chi2/n={res.fun/max(int(fitmask.sum())-2, 1):.3f}')
+
+        if M_prev is not None and abs(M_now - M_prev) <= M_tol*abs(M_now):
             break
-        M_prev = M_fit
+        M_prev = M_now
         if _it == max_iter - 1:
             break
         # remove migration, refit reset-decay on the de-migrated gradient
         Q = np.zeros((nyc, nxc)); Qprev = Q.copy()
         photo = np.zeros((n_grads, nyc, nxc))
         for g in range(n_grads):
-            Q = _mig_group(Q + rate_c, M_fit, thr_fit)
+            Q = _mig_group(Q + rate_c, Mx_fit, My_fit, thr_fit)
             photo[g] = Q - Qprev; Qprev = Q.copy()
         med_corr = med_obs_c - (photo - rate_c[None])
         pc, _, _, _ = np.linalg.lstsq(Xb, med_corr.reshape(n_grads, -1), rcond=None)
@@ -847,17 +885,76 @@ def fit_migration_params(cube, M_init=1.0e-6, thr_init=50.0, bg_mask=None,
         delta_c = pc[2].reshape(nyc, nxc)
 
     if verbose:
-        print(f'  M = {M_fit:.4e}  threshold = {thr_fit:.1f} DN  at x={sx}, y={sy}')
-    return M_fit, thr_fit, sx, sy
+        if aniso:
+            print(f'  Mx={Mx_fit:.4e}  My={My_fit:.4e}  threshold={thr_fit:.1f} DN  '
+                  f'at x={sx}, y={sy}')
+        else:
+            print(f'  M={Mx_fit:.4e}  threshold={thr_fit:.1f} DN  at x={sx}, y={sy}')
+
+    if diagnostics:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        sim = model_diff(Mx_fit, My_fit, thr_fit, rate_c, Adec_c, delta_c)
+        res = obs - sim
+
+        rr = np.round(rmap).astype(int)
+        r_int = np.arange(0, cut)
+        rp_obs = np.array([np.nanmean(obs[rr == ri]) for ri in r_int])
+        rp_sim = np.array([np.nanmean(sim[rr == ri]) for ri in r_int])
+
+        vabs = np.nanpercentile(np.abs(obs), 99.5)
+        ext = [-cut - 0.5, cut + 0.5, -cut - 0.5, cut + 0.5]
+
+        fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+        if aniso:
+            title_model = f'Model (Mx={Mx_fit:.2e}, My={My_fit:.2e}, thr={thr_fit:.1f})'
+        else:
+            title_model = f'Model (M={Mx_fit:.2e}, thr={thr_fit:.1f} DN)'
+        for ax, img, title in [
+            (axes[0, 0], obs,  'Observed late$-$early'),
+            (axes[0, 1], sim,  title_model),
+            (axes[1, 0], res,  'Residual (obs$-$model)'),
+        ]:
+            im = ax.imshow(img, origin='lower', cmap='RdBu_r',
+                           vmin=-vabs, vmax=vabs, extent=ext)
+            fig.colorbar(im, ax=ax, label=r'Norm. $\Delta$flux')
+            ax.set_title(title)
+            ax.set_xlabel(r'$\Delta x$ (px)')
+            ax.set_ylabel(r'$\Delta y$ (px)')
+
+        ax = axes[1, 1]
+        ax.plot(r_int, rp_obs, 'k-', lw=1.5, label='Observed')
+        ax.plot(r_int, rp_sim, color='C3', ls='--', lw=1.5, label='Model')
+        ax.axhline(0, color='k', lw=0.5, ls=':')
+        ax.axvline(fit_r, color='C0', lw=1.0, ls='--', label=f'fit_r = {fit_r} px')
+        ax.set_xlabel('Radius (px)')
+        ax.set_ylabel(r'Mean $\Delta$flux')
+        ax.set_title('Radial profile')
+        ax.legend(fontsize=8)
+
+        fig.suptitle(f'Migration fit diagnostics  (star x={sx}, y={sy})',
+                     fontsize=11, fontweight='bold')
+        fig.tight_layout()
+        if save_path is None:
+            save_path = 'migration_fit_diagnostics.png'
+        fig.savefig(Path(save_path), dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        if verbose:
+            print(f'  Saved migration fit diagnostics to {save_path}')
+
+    return Mx_fit, My_fit, thr_fit, sx, sy
 
 
 def correct_bfe_rcd(cube, method='migration',
-                    M_mig=1.0e-6, thr_mig=50.0,
+                    M_mig=1.0e-6, M_mig_y=1, thr_mig=50.0,
                     A_bfe=1.035e-6, alpha_bfe=3.43, b_bfe=-0.50, c_bfe=0.056,
                     bg_mask=None, late_groups=None, verbose=False,
                     fit_bfe=False, sci_mask=None,
                     bfe_early_groups=None, bfe_late_groups=None,
                     ap_radius=5, cut=20, fit_r=10,
+                    star_x=None, star_y=None,
                     diagnostics=False, save_path=None):
     """
     Joint BFE + reset-decay correction for MIRI ramp data.
@@ -948,21 +1045,25 @@ def correct_bfe_rcd(cube, method='migration',
     if late_groups is None:
         late_groups = list(range(n_grads - 3, n_grads))
 
+    _My_aniso = None  # set below if aniso fit runs
+
     if fit_bfe:
         if method == 'migration':
             if verbose:
                 print('Fitting migration parameters from brightest source...')
-            M_fit, thr_fit, _sx, _sy = fit_migration_params(
+            Mx_fit, My_fit, thr_fit, _sx, _sy = fit_migration_params(
                 cube, M_init=M_mig, thr_init=thr_mig, bg_mask=bg_mask,
                 sci_mask=sci_mask, bfe_early_groups=bfe_early_groups,
                 bfe_late_groups=bfe_late_groups, ap_radius=ap_radius, cut=cut,
-                fit_r=fit_r, verbose=verbose)
-            if M_fit is None:
+                fit_r=fit_r, verbose=verbose, aniso=(M_mig_y is None))
+            if Mx_fit is None:
                 if verbose:
                     print('No source meets brightness threshold — skipping BFE correction')
                 M_mig = 0.0
             else:
-                M_mig, thr_mig = M_fit, thr_fit
+                M_mig, thr_mig = Mx_fit, thr_fit
+                if M_mig_y is None:
+                    _My_aniso = My_fit
                 if verbose:
                     print(f'Using fitted M={M_mig:.4e}  threshold={thr_mig:.1f} DN '
                           f'at x={_sx}, y={_sy}')
@@ -991,12 +1092,15 @@ def correct_bfe_rcd(cube, method='migration',
         # Charge-migration inversion: recover the migration-free gradients with
         # a Born-style fixed point on the median ramp, then apply the per-group
         # correction to every integration. Charge is conserved by construction.
+        # Migration is cardinal-only (x and y axes; diagonal = 0 by construction).
+        # M_mig_y is a ratio: My = M_mig * M_mig_y. None means aniso fit was run.
+        _M_y = _My_aniso if _My_aniso is not None else M_mig * (M_mig_y if M_mig_y is not None else 1)
         med_obs = np.median(grads_raw[:, :n_grads_all], axis=0)
         grads_bfe = grads_raw.copy()
         if M_mig and M_mig > 0:
             if verbose:
                 print('  migration inversion...')
-            true_grads = _mig_invert(med_obs, M_mig, thr_mig)
+            true_grads = _mig_invert(med_obs, M_mig, _M_y, thr_mig)
             for g in range(n_grads_all):
                 grads_bfe[:, g] = grads_raw[:, g] + (true_grads[g] - med_obs[g])[None]
     else:
@@ -1034,9 +1138,16 @@ def correct_bfe_rcd(cube, method='migration',
         mean_bg = np.nanmean(med_bfe[1:].reshape(n_grads-1, -1), axis=1)
 
     def _exp1(g, C, A, tau): return C + A * np.exp(-g / tau)
-    popt, _ = curve_fit(_exp1, g_fit, mean_bg,
-                        p0=[mean_bg[-1], mean_bg[0] - mean_bg[-1], 1.5])
-    tau = float(popt[2])
+    popt = None
+    if len(g_fit) >= 3:
+        popt, _ = curve_fit(_exp1, g_fit, mean_bg,
+                            p0=[mean_bg[-1], mean_bg[0] - mean_bg[-1], 1.5])
+        tau = float(popt[2])
+    else:
+        # Too few points to fit tau; use fixed default and fit only A and C.
+        tau = 1.5
+        if verbose:
+            print(f'  too few groups to fit tau — using tau={tau:.2f} (fixed)')
 
     exp_g = np.exp(-g_arr / tau)
     ff_col = np.zeros(n_grads); ff_col[0] = -1.0
@@ -1076,11 +1187,15 @@ def correct_bfe_rcd(cube, method='migration',
         ax = axes[0, 0]
         g_fine = np.linspace(1, n_grads - 1, 200)
         ax.plot(g_fit, mean_bg, 'o', color='k', ms=5, label='Background mean')
-        ax.plot(g_fine, popt[0] + popt[1] * np.exp(-g_fine / tau), '--',
-                color='C3', lw=1.5, label=f'Fit  τ={tau:.2f} grp')
+        if popt is not None:
+            ax.plot(g_fine, popt[0] + popt[1] * np.exp(-g_fine / tau), '--',
+                    color='C3', lw=1.5, label=f'Fit  tau={tau:.2f} grp')
+        else:
+            ax.axhline(np.nanmean(mean_bg), color='C3', ls='--', lw=1.5,
+                       label=f'Fixed tau={tau:.2f} grp')
         ax.set_xlabel('Gradient index')
         ax.set_ylabel('Mean gradient (DN/group)')
-        ax.set_title('Global τ fit (after BFE step)')
+        ax.set_title('Global tau fit (after BFE step)')
         ax.legend(fontsize=8)
         ax.set_xticks(g_arr.astype(int))
 
@@ -1101,7 +1216,7 @@ def correct_bfe_rcd(cube, method='migration',
         ax.set_yscale('log')
         ax.set_xlabel('Gradient index')
         ax.set_ylabel('99.9th pct |BFE correction| (DN/group)')
-        ax.set_title(f'BFE step size  (A={A_bfe:.2e}, α={alpha_bfe:.3f})')
+        ax.set_title(f'BFE step size  (M={M_mig:.2e})')
         ax.set_xticks(range(n_grads_all))
 
         ax = axes[1, 1]
@@ -1129,7 +1244,208 @@ def correct_bfe_rcd(cube, method='migration',
         if verbose:
             print(f'Saved correction diagnostics to {save_path}')
 
+        if star_x is not None and star_y is not None:
+            _diag_pixel_ramps(
+                cube, grads_raw, grads_bfe, grads_joint, grads_cor,
+                star_x, star_y, n_grads_all,
+                save_path=str(save_path).replace('.png', '_pixel_ramps.pdf'),
+                verbose=verbose)
+            _diag_pixel_locations(
+                grads_raw, star_x, star_y, n_grads, ny, nx,
+                save_path=str(save_path).replace('.png', '_pixel_locations.pdf'),
+                verbose=verbose)
+
     return cube_cor
+
+
+def _diag_pixel_ramps(cube, grads_raw, grads_bfe, grads_joint, grads_cor,
+                      star_x, star_y, n_grads_all,
+                      save_path='bfe_rcd_pixel_ramps.pdf', verbose=False):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    n_int, n_groups = cube.shape[0], cube.shape[1]
+    ny, nx = cube.shape[2], cube.shape[3]
+    groups = np.arange(n_groups)
+
+    sky_y = max(5, min(ny - 5, star_y - 15))
+    sky_x = max(5, min(nx - 5, star_x + 10))
+
+    diag_pixels = [
+        (star_y, star_x, 'Star centre ($r=0$)'),
+        (star_y, star_x + 3, r'Between core \& ring ($r=3$)'),
+        (star_y, star_x + 5, r'On ring ($r=5$)'),
+        (sky_y, sky_x, 'Sky'),
+    ]
+
+    fig_width = 240.0 / 72.27
+    plt.rcParams.update({'font.family': 'serif', 'text.usetex': True, 'font.size': 9})
+
+    fig, axes = plt.subplots(4, 4, figsize=(4 * fig_width, 3 * fig_width),
+                             gridspec_kw={'height_ratios': [2, 1, 1, 1]})
+
+    def _mean_ramp(grads_stage, py, px):
+        px0 = cube[:, 0, py, px]
+        csum = np.cumsum(grads_stage[:, :n_grads_all, py, px], axis=1)
+        return np.column_stack([px0[:, None], px0[:, None] + csum]).mean(axis=0)
+
+    def _all_ramps(grads_stage, py, px):
+        px0 = cube[:, 0, py, px]
+        csum = np.cumsum(grads_stage[:, :n_grads_all, py, px], axis=1)
+        return np.column_stack([px0[:, None], px0[:, None] + csum])
+
+    for col, (sy, sx, label) in enumerate(diag_pixels):
+        ramp_raw = _mean_ramp(grads_raw, sy, sx)
+        ramp_bfe_px = _mean_ramp(grads_bfe, sy, sx)
+        ramp_joint_px = _mean_ramp(grads_joint, sy, sx)
+        ramp_cor = _mean_ramp(grads_cor, sy, sx)
+
+        bfe_contrib = ramp_bfe_px - ramp_raw
+        rcd_contrib = ramp_joint_px - ramp_bfe_px
+        nonpar_contrib = ramp_cor - ramp_joint_px
+
+        ax_top = axes[0, col]
+        ax_mid = axes[1, col]
+        ax_bot = axes[2, col]
+        ax_cmp = axes[3, col]
+
+        for ramp, all_ramps, color, ls, stage, ax_res in [
+            (ramp_raw, _all_ramps(grads_raw, sy, sx), 'k', '-', 'Before', ax_mid),
+            (ramp_cor, _all_ramps(grads_cor, sy, sx), 'C3', '--', 'After', ax_bot),
+        ]:
+            coeffs, cov = np.polyfit(groups[1:-1], ramp[1:-1], 1, cov=True)
+            slope, intercept = coeffs
+            slope_err = np.sqrt(cov[0, 0])
+            line = slope * groups + intercept
+            resid = ramp - line
+            all_resid = all_ramps - line[None, :]
+
+            ax_top.plot(groups[1:-1], ramp[1:-1], 'o', color=color, ms=2, zorder=3)
+            ax_top.plot(groups[[0, -1]], ramp[[0, -1]], 'o', color=color, ms=2, mfc='none', zorder=3)
+            ax_top.plot(groups, line, ls=ls, color=color, lw=1.0,
+                        label=rf'{stage}: $\hat{{m}}={slope:.1f}\pm{slope_err:.2g}$')
+
+            ax_res.axhline(0, color='gray', lw=0.5, ls=':')
+            ax_res.scatter(np.tile(groups, n_int), all_resid.ravel(),
+                           s=0.5, color=color, alpha=0.05, zorder=1, linewidths=0)
+            ax_res.plot(groups, resid, '-', color=color, lw=0.8)
+            ax_res.plot(groups[1:-1], resid[1:-1], 'o', color=color, ms=2)
+            ax_res.plot(groups[[0, -1]], resid[[0, -1]], 'o', color=color, ms=2, mfc='none')
+            ax_res.set_xticks(groups[::2])
+            if col == 0:
+                ax_res.set_ylabel(f'{stage} resid.\\ (DN)')
+
+            inner = resid[1:-1]
+            pad = max(np.ptp(inner) * 0.4, 5.0)
+            ax_res.set_ylim(inner.min() - pad, inner.max() + pad)
+
+        ax_top.scatter(np.tile(groups, n_int), cube[:, :, sy, sx].ravel(),
+                       s=0.5, color='k', alpha=0.05, zorder=1, linewidths=0)
+        ax_top.set_title(label, fontsize=8)
+        ax_top.set_xticks(groups[::2])
+        ax_top.tick_params(labelbottom=False)
+        if col == 0:
+            ax_top.set_ylabel('DN')
+        ax_top.legend(fontsize=6, frameon=False)
+
+        ax_mid.tick_params(labelbottom=False)
+        ax_bot.tick_params(labelbottom=False)
+
+        ax_cmp.axhline(0, color='gray', lw=0.5, ls=':')
+        ax_cmp.plot(groups, bfe_contrib, '-', color='C0', lw=0.8)
+        ax_cmp.plot(groups[1:-1], bfe_contrib[1:-1], 'o', color='C0', ms=2, label='BFE')
+        ax_cmp.plot(groups[[0, -1]], bfe_contrib[[0, -1]], 'o', color='C0', ms=2, mfc='none')
+        ax_cmp.plot(groups, rcd_contrib, '-', color='C1', lw=0.8)
+        ax_cmp.plot(groups[1:-1], rcd_contrib[1:-1], 's', color='C1', ms=2, label='RCD')
+        ax_cmp.plot(groups[[0, -1]], rcd_contrib[[0, -1]], 's', color='C1', ms=2, mfc='none')
+        ax_cmp.plot(groups, nonpar_contrib, '-', color='C2', lw=0.8)
+        ax_cmp.plot(groups[1:-1], nonpar_contrib[1:-1], '^', color='C2', ms=2, label='Non-par.')
+        ax_cmp.plot(groups[[0, -1]], nonpar_contrib[[0, -1]], '^', color='C2', ms=2, mfc='none')
+        ax_cmp.set_xlabel('Group index')
+        ax_cmp.set_xticks(groups[::2])
+        if col == 0:
+            ax_cmp.set_ylabel('Correction (DN)')
+            ax_cmp.legend(fontsize=6, frameon=False)
+
+    fig.tight_layout()
+    fig.savefig(save_path, bbox_inches='tight')
+    plt.close(fig)
+    plt.rcParams.update({'font.family': 'sans-serif', 'text.usetex': False, 'font.size': 10})
+    if verbose:
+        print(f'Saved pixel ramp diagnostics to {save_path}')
+
+
+def _diag_pixel_locations(grads_raw, star_x, star_y, n_grads, ny, nx,
+                           save_path='bfe_rcd_pixel_locations.pdf', verbose=False):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    med_raw = np.median(grads_raw[:, :n_grads], axis=0)   # (n_grads, ny, nx)
+
+    cut = 18
+    early_groups_loc = [g for g in [2, 3] if g < n_grads]
+    late_groups_loc = [g for g in [n_grads - 3, n_grads - 2, n_grads - 1] if 0 <= g < n_grads]
+
+    cy, cx = star_y, star_x
+    y0 = max(0, cy - cut)
+    y1 = min(ny, cy + cut + 1)
+    x0 = max(0, cx - cut)
+    x1 = min(nx, cx + cut + 1)
+
+    yy, xx = np.mgrid[:2*cut+1, :2*cut+1]
+    r_map = np.sqrt((yy - cut)**2 + (xx - cut)**2)
+    norm_ap = r_map <= (cut - 4)
+    bg_ann = (r_map > (cut - 4)) & (r_map <= (cut - 1))
+
+    def _norm_group(g):
+        c = med_raw[g, y0:y1, x0:x1]
+        if c.shape != (2*cut+1, 2*cut+1):
+            return np.zeros((2*cut+1, 2*cut+1))
+        c = c - np.median(c[bg_ann])
+        s = c[norm_ap].sum()
+        return c / s if s != 0 else c
+
+    early_img = np.mean([_norm_group(g) for g in early_groups_loc], axis=0)
+    late_img = np.mean([_norm_group(g) for g in late_groups_loc], axis=0)
+    bfe_img_scaled = (late_img - early_img) / 1e-4
+
+    sky_y = max(5, min(ny - 5, star_y - 15))
+    sky_x = max(5, min(nx - 5, star_x + 10))
+
+    loc_pixels = [
+        (star_y, star_x, 'Star centre', 'C3', '*', 12),
+        (star_y, star_x + 3, r'Between core \& ring ($r=3$)', 'C0', 'o', 8),
+        (star_y, star_x + 5, r'On ring ($r=5$)', 'C1', 's', 8),
+        (sky_y, sky_x, 'Sky', 'C4', 'D', 6),
+    ]
+
+    plt.rcParams.update({'font.family': 'serif', 'text.usetex': True, 'font.size': 9})
+
+    fig, ax = plt.subplots(figsize=(4.5, 4))
+    vabs = np.nanpercentile(np.abs(bfe_img_scaled), 99.5)
+    ext = [cx - cut - 0.5, cx + cut + 0.5, cy - cut - 0.5, cy + cut + 0.5]
+    im = ax.imshow(bfe_img_scaled, origin='lower', cmap='RdBu_r',
+                   vmin=-vabs, vmax=vabs, extent=ext)
+    fig.colorbar(im, ax=ax, label=r'Norm.\ $\Delta$flux ($\times10^{-4}$)',
+                 fraction=0.046, pad=0.04)
+
+    for py, px, label, color, marker, ms in loc_pixels:
+        ax.plot(px, py, marker=marker, color=color, ms=ms, mew=1.5,
+                markeredgecolor='w', zorder=5, label=label)
+
+    ax.set_xlabel(r'$x$ (px)')
+    ax.set_ylabel(r'$y$ (px)')
+    ax.legend(fontsize=7, frameon=True, facecolor='0.15', labelcolor='white',
+              loc='upper left')
+
+    fig.tight_layout()
+    fig.savefig(save_path, bbox_inches='tight')
+    plt.close(fig)
+    plt.rcParams.update({'font.family': 'sans-serif', 'text.usetex': False, 'font.size': 10})
+    if verbose:
+        print(f'Saved pixel location diagnostics to {save_path}')
 
 
 def correct_ramp(cube, C_map):

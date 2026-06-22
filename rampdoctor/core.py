@@ -45,7 +45,7 @@ class RampDoctor:
     """
 
     def __init__(self, cube=None, file=None, dq=None, method='migration',
-                 M_mig=1.0e-6, thr_mig=50.0, A_bfe=1.035e-6,
+                 M_mig=1.0e-6, M_mig_y=1, thr_mig=50.0, A_bfe=1.035e-6,
                  alpha_bfe=3.43, b_bfe=-0.50, c_bfe=0.056,
                  bg_mask=None, sci_mask=None, verbose=False):
         self.file = Path(file) if file is not None else None
@@ -64,6 +64,7 @@ class RampDoctor:
         self.dq = dq
         self.method = method
         self.M_mig = M_mig
+        self.M_mig_y = M_mig_y
         self.thr_mig = thr_mig
         self.A_bfe = A_bfe
         self.alpha_bfe = alpha_bfe
@@ -109,16 +110,20 @@ class RampDoctor:
             no source met the brightness threshold.
         """
         if self.method == 'migration':
-            M, thr, sx, sy = fit_migration_params(
+            Mx, My, thr, sx, sy = fit_migration_params(
                 self.cube, M_init=self.M_mig, thr_init=self.thr_mig,
                 bg_mask=self.bg_mask, sci_mask=self.sci_mask,
                 bfe_early_groups=bfe_early_groups, bfe_late_groups=bfe_late_groups,
-                ap_radius=ap_radius, cut=cut, fit_r=fit_r, verbose=self.verbose)
-            if M is None:
+                ap_radius=ap_radius, cut=cut, fit_r=fit_r, verbose=self.verbose,
+                aniso=(self.M_mig_y is None),
+                diagnostics=diagnostics, save_path=save_path)
+            if Mx is None:
                 return None
-            self.M_mig, self.thr_mig = M, thr
+            self.M_mig, self.thr_mig = Mx, thr
+            if self.M_mig_y is None:
+                self.M_mig_y = My / Mx
             self.star_x, self.star_y = sx, sy
-            return M
+            return Mx
 
         alpha = None if fit_alpha else self.alpha_bfe
         result = fit_bfe_params(
@@ -172,11 +177,12 @@ class RampDoctor:
             self.fit_bfe(diagnostics=diagnostics)
         self.cube_cor = correct_bfe_rcd(
             self.cube, method=self.method,
-            M_mig=self.M_mig, thr_mig=self.thr_mig,
+            M_mig=self.M_mig, M_mig_y=self.M_mig_y, thr_mig=self.thr_mig,
             A_bfe=self.A_bfe, alpha_bfe=self.alpha_bfe,
             b_bfe=self.b_bfe, c_bfe=self.c_bfe,
             bg_mask=self.bg_mask, late_groups=late_groups,
             sci_mask=self.sci_mask, verbose=self.verbose,
+            star_x=self.star_x, star_y=self.star_y,
             diagnostics=diagnostics, save_path=save_path, **kwargs)
         return self.cube_cor
 
