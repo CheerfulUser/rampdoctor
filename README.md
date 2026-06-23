@@ -48,7 +48,7 @@ Or use the object-oriented interface:
 ```python
 from rampdoctor import RampDoctor
 
-rd = RampDoctor(file='jw_mirimage_uncal.fits', verbose=True)
+rd = RampDoctor(file='jw_mirimage_ramp.fits', verbose=True)
 rd.fit_bfe()
 cube_cor = rd.correct()
 rd.save('corrected.fits')
