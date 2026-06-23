@@ -93,11 +93,11 @@ re-fit prevents the decay and migration parameters from absorbing each other.
 
 ## Validation
 
-| Target | Filter | WISE mag | Data | M (fit) | Threshold | RMS before | RMS after | Improvement |
-|---|---|---|---|---|---|---|---|---|
-| Wolf 359 | F2100W | W4 = 5.30 | ramp.fits | 4.32×10⁻⁷ | 37.8 DN | 1.03% | 0.21% | 4.9× |
-| TRAPPIST-1 | F1500W | W3 = 9.51 | ramp.fits | 4.09×10⁻⁷ | 36.6 DN | 0.80% | 0.22% | 3.6× |
-| EV Lac | F2100W | W4 = 4.75 | ramp.fits | 2.40×10⁻⁷ | 74.9 DN | 0.65% | 0.16% | 4.1× |
+| Target | Filter | WISE mag | M (fit) | Threshold | RMS before | RMS after | Improvement |
+|---|---|---|---|---|---|---|---|
+| Wolf 359 | F2100W | W4 = 5.30 | 4.32×10⁻⁷ | 37.8 DN | 1.03% | 0.21% | 4.9× |
+| TRAPPIST-1 | F1500W | W3 = 9.51 | 4.09×10⁻⁷ | 36.6 DN | 0.80% | 0.22% | 3.6× |
+| EV Lac | F2100W | W4 = 4.75 | 2.40×10⁻⁷ | 74.9 DN | 0.65% | 0.16% | 4.1× |
 
 The consistent `M` and threshold across two independent MIRI targets
 (observed in different modes) support their use as instrument-level
