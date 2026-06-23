@@ -105,7 +105,7 @@ defaults.
 
 ## Example diagnostics
 
-Migration model fit on EV Lac (MIRI SUB256, ramp.fits): observed
+Migration model fit on Wolf 359 (MIRI SUB256, F2100W, ramp.fits): observed
 late−early PSF difference, best-fit migration model, residual, and
 radial profile.
 
