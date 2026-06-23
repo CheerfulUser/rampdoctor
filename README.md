@@ -104,8 +104,7 @@ re-fit prevents the decay and migration parameters from absorbing each other.
 
 The consistent `M` and threshold across two independent MIRI targets
 (observed in different modes) support their use as instrument-level
-defaults. On raw (`uncal`) data, jointly fitting the linearity coefficient
-`a` alongside `M` reduces chi²/N from 11.6 to 5.5 for Wolf 359.
+defaults. 
 
 ## Example diagnostics
 
