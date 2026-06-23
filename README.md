@@ -63,20 +63,22 @@ The correction applies two sequential steps to the group-to-group gradients:
 
 **Step 1 — BFE inversion (charge-migration model)**
 
-The forward model per group is:
+Each group difference is modelled as a true flux gradient that has been
+redistributed by charge migration between readouts:
 
 ```
-dQ = F_true / poly'(Q) + A_crd * exp(-g / tau)
-Q  = _mig_group(Q + dQ, M, threshold)
+Q_g = _mig_group(Q_{g-1} + dQ_true, M, threshold)
+obs_g = Q_g - Q_{g-1}
 ```
 
-where `F_true` is the true photon flux rate, `poly'(Q) = 1 + 2aQ` is the
-detector linearity derivative (fitted jointly on uncal data), `A_crd` is the
-per-pixel RCD amplitude, `M` is the charge-migration strength, and
-`threshold` is an activation level below which migration is negligible.
-Migration-free gradients are recovered by Born iteration on `F_true`.
-Calibrated defaults (`M = 4.2×10⁻⁷`, `threshold = 37.2 DN`) are derived
-from fits to linearised MIRI ramp data across two targets.
+`_mig_group` shifts a fraction of the charge in each pixel into its
+cardinal neighbours proportional to `M × max(Q − threshold, 0)`.
+Migration-free gradients are recovered from the median ramp by Born
+iteration. The per-integration correction is the difference between
+the recovered true gradient and the observed median gradient, applied
+uniformly across integrations. Calibrated defaults (`M = 4.2×10⁻⁷`,
+`threshold = 37.2 DN`) are derived from fits to linearised MIRI ramp
+data across two targets.
 
 **Step 2 — RCD subtraction**
 
@@ -88,16 +90,15 @@ subtracted from every gradient of every integration.
 **Optional: BFE parameter fitting**
 
 When `fit_bfe=True`, `fit_migration_params` detects the brightest source via
-SEP and fits `M` and `threshold` (optionally also the linearity coefficient
-`a`) by minimising the residual between the observed and modelled
-late−early PSF difference image. An iterative RCD re-fit prevents the decay
-and migration parameters from absorbing each other.
+SEP and fits `M` and `threshold` by minimising the residual between the
+observed and modelled late−early PSF difference image. An iterative RCD
+re-fit prevents the decay and migration parameters from absorbing each other.
 
 ## Validation
 
 | Target | Data | M (fit) | Threshold | RMS before | RMS after |
 |---|---|---|---|---|---|
-| Wolf 359 | ramp.fits | 4.32×10⁻⁷ | 37.8 DN | — | — |
+| Wolf 359 | ramp.fits | 4.32×10⁻⁷ | 37.8 DN | 1.03% | 0.21% |
 | TRAPPIST-1 | ramp.fits | 4.09×10⁻⁷ | 36.6 DN | 0.80% | 0.22% |
 
 The consistent `M` and threshold across two independent MIRI targets
