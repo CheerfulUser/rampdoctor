@@ -107,17 +107,20 @@ defaults. On raw (`uncal`) data, jointly fitting the linearity coefficient
 
 ## Example diagnostics
 
-BFE fit on a JWST MIRI observation (`fit_bfe=True, diagnostics=True`):
-observed late−early PSF difference, best-fit migration model, residual,
-and radial profiles.
+Migration model fit on Wolf 359 (MIRI SUB256, ramp.fits): observed
+late−early PSF difference, best-fit migration model, residual, and
+radial profile.
 
-![BFE fit diagnostics](figs/bfe_fit_diagnostics.png)
+![Migration fit diagnostics](figs/bfe_fit_diagnostics.png)
 
-Correction diagnostics (`diagnostics=True`): the global decay timescale
-fit, per-pixel decay amplitude map, BFE correction per group, and background
-gradient profiles at each stage.
+Pixel locations selected for ramp diagnostics (star, background, and
+reference pixels).
 
-![Correction diagnostics](figs/bfe_rcd_diagnostics.png)
+![Pixel location diagnostics](figs/bfe_pixel_locations.png)
+
+Per-pixel ramp profiles before and after each correction stage.
+
+![Pixel ramp diagnostics](figs/bfe_pixel_ramps.png)
 
 ## Tests
 

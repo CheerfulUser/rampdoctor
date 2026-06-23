@@ -1278,11 +1278,11 @@ def correct_bfe_rcd(cube, method='migration',
             _diag_pixel_ramps(
                 cube, grads_raw, grads_bfe, grads_joint, grads_cor,
                 star_x, star_y, n_grads_all,
-                save_path=str(save_path).replace('.png', '_pixel_ramps.pdf'),
+                save_path=str(save_path).replace('.png', '_pixel_ramps.png'),
                 verbose=verbose)
             _diag_pixel_locations(
                 grads_raw, star_x, star_y, n_grads, ny, nx,
-                save_path=str(save_path).replace('.png', '_pixel_locations.pdf'),
+                save_path=str(save_path).replace('.png', '_pixel_locations.png'),
                 verbose=verbose)
 
     return cube_cor
@@ -1290,7 +1290,7 @@ def correct_bfe_rcd(cube, method='migration',
 
 def _diag_pixel_ramps(cube, grads_raw, grads_bfe, grads_joint, grads_cor,
                       star_x, star_y, n_grads_all,
-                      save_path='bfe_rcd_pixel_ramps.pdf', verbose=False):
+                      save_path='bfe_rcd_pixel_ramps.png', verbose=False):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -1399,7 +1399,7 @@ def _diag_pixel_ramps(cube, grads_raw, grads_bfe, grads_joint, grads_cor,
             ax_cmp.legend(fontsize=6, frameon=False)
 
     fig.tight_layout()
-    fig.savefig(save_path, bbox_inches='tight')
+    fig.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
     plt.rcParams.update({'font.family': 'sans-serif', 'text.usetex': False, 'font.size': 10})
     if verbose:
@@ -1407,7 +1407,7 @@ def _diag_pixel_ramps(cube, grads_raw, grads_bfe, grads_joint, grads_cor,
 
 
 def _diag_pixel_locations(grads_raw, star_x, star_y, n_grads, ny, nx,
-                           save_path='bfe_rcd_pixel_locations.pdf', verbose=False):
+                           save_path='bfe_rcd_pixel_locations.png', verbose=False):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -1471,7 +1471,7 @@ def _diag_pixel_locations(grads_raw, star_x, star_y, n_grads, ny, nx,
               loc='upper left')
 
     fig.tight_layout()
-    fig.savefig(save_path, bbox_inches='tight')
+    fig.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
     plt.rcParams.update({'font.family': 'sans-serif', 'text.usetex': False, 'font.size': 10})
     if verbose:
