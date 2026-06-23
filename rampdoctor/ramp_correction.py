@@ -746,7 +746,7 @@ def fit_migration_params(cube, M_init=4.2e-7, thr_init=37.2, bg_mask=None,
     if len(obj) == 0 or obj[np.argmax(obj['flux'])]['flux'] < 50000:
         if verbose:
             print('  No source meets brightness threshold — skipping migration fit')
-        return None, thr_init, nx//2, ny//2
+        return None, None, thr_init, nx//2, ny//2
     star = obj[np.argmax(obj['flux'])]
     sy, sx = int(round(star['y'])), int(round(star['x']))
 
@@ -1377,7 +1377,7 @@ def _diag_pixel_ramps(cube, grads_raw, grads_bfe, grads_joint, grads_cor,
         ax_top.tick_params(labelbottom=False)
         if col == 0:
             ax_top.set_ylabel('DN')
-        ax_top.legend(fontsize=6, frameon=False)
+        ax_top.legend(fontsize=9, frameon=False)
 
         ax_mid.tick_params(labelbottom=False)
         ax_bot.tick_params(labelbottom=False)
@@ -1396,7 +1396,7 @@ def _diag_pixel_ramps(cube, grads_raw, grads_bfe, grads_joint, grads_cor,
         ax_cmp.set_xticks(groups[::2])
         if col == 0:
             ax_cmp.set_ylabel('Correction (DN)')
-            ax_cmp.legend(fontsize=6, frameon=False)
+            ax_cmp.legend(fontsize=9, frameon=False)
 
     fig.tight_layout()
     fig.savefig(save_path, dpi=300, bbox_inches='tight')
