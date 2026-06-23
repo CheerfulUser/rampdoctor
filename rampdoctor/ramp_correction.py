@@ -710,10 +710,11 @@ def _mig_invert(med_obs, Mx, My, thr, n_born=4):
     return true_grads
 
 
-def fit_migration_params(cube, M_init=1.0e-6, thr_init=50.0, bg_mask=None,
+def fit_migration_params(cube, M_init=4.2e-7, thr_init=37.2, bg_mask=None,
                          sci_mask=None, bfe_early_groups=None, bfe_late_groups=None,
                          ap_radius=5, cut=20, fit_r=None, verbose=False,
                          max_iter=6, M_tol=0.02, aniso=False,
+                         fix_M=None, fix_thr=None,
                          diagnostics=False, save_path=None):
     """Fit the charge-migration BFE parameters from the brightest source.
 
@@ -824,44 +825,71 @@ def fit_migration_params(cube, M_init=1.0e-6, thr_init=50.0, bg_mask=None,
 
     logM0, thr0 = np.log10(M_init), thr_init
     Mx_fit = My_fit = M_init
+    thr_fit = thr_init
     M_prev = None
+
+    # If M or thr are fixed, skip the iterative optimisation entirely
+    if fix_M is not None and fix_thr is not None:
+        Mx_fit = My_fit = float(fix_M)
+        thr_fit = float(fix_thr)
+        if verbose:
+            print(f'  M and thr fixed: M={Mx_fit:.4e}  thr={thr_fit:.1f} DN')
+        max_iter = 0
 
     for _it in range(max_iter):
         if aniso:
+            if fix_M is not None:
+                logMx0 = logMy0 = np.log10(float(fix_M))
+            else:
+                logMx0 = logMy0 = logM0
+            _thr0 = float(fix_thr) if fix_thr is not None else thr0
+
             def chi2(par):
                 logMx, logMy, thr = par
+                if fix_M is not None:
+                    logMx = logMy = np.log10(float(fix_M))
+                if fix_thr is not None:
+                    thr = float(fix_thr)
                 if not (-9 <= logMx <= -2 and -9 <= logMy <= -2 and 0 <= thr <= 5000):
                     return 1e30
                 d = model_diff(10**logMx, 10**logMy, thr, rate_c, Adec_c, delta_c)
                 if not np.all(np.isfinite(d)):
                     return 1e30
                 return float(np.sum((((d - obs) * w)[fitmask])**2))
-            x0 = [logM0, logM0, thr0]
+            x0 = [logMx0, logMy0, _thr0]
             res = _minimize(chi2, x0, method='Powell',
                             options={'xtol': 1e-4, 'ftol': 1e-7, 'maxiter': 2000})
-            Mx_fit = 10**res.x[0]
-            My_fit = 10**res.x[1]
-            thr_fit = max(0.0, res.x[2])
-            logM0 = (res.x[0] + res.x[1]) / 2
+            Mx_fit = float(fix_M) if fix_M is not None else 10**res.x[0]
+            My_fit = float(fix_M) if fix_M is not None else 10**res.x[1]
+            thr_fit = float(fix_thr) if fix_thr is not None else max(0.0, res.x[2])
+            logM0 = (np.log10(Mx_fit) + np.log10(My_fit)) / 2
             thr0 = thr_fit
             M_now = (Mx_fit + My_fit) / 2
             if verbose:
                 print(f'  [iter {_it}] Mx={Mx_fit:.4e}  My={My_fit:.4e}  '
                       f'thr={thr_fit:.1f} DN  chi2/n={res.fun/max(int(fitmask.sum())-3, 1):.3f}')
         else:
+            _logM0 = np.log10(float(fix_M)) if fix_M is not None else logM0
+            _thr0 = float(fix_thr) if fix_thr is not None else thr0
+
             def chi2(par):
                 logM, thr = par
+                if fix_M is not None:
+                    logM = np.log10(float(fix_M))
+                if fix_thr is not None:
+                    thr = float(fix_thr)
                 if not (-9 <= logM <= -2 and 0 <= thr <= 5000):
                     return 1e30
                 d = model_diff(10**logM, 10**logM, thr, rate_c, Adec_c, delta_c)
                 if not np.all(np.isfinite(d)):
                     return 1e30
                 return float(np.sum((((d - obs) * w)[fitmask])**2))
-            res = _minimize(chi2, [logM0, thr0], method='Powell',
+            res = _minimize(chi2, [_logM0, _thr0], method='Powell',
                             options={'xtol': 1e-4, 'ftol': 1e-7, 'maxiter': 1500})
-            Mx_fit = My_fit = 10**res.x[0]
-            thr_fit = max(0.0, res.x[1])
-            logM0, thr0 = res.x[0], thr_fit
+            Mx_fit = My_fit = float(fix_M) if fix_M is not None else 10**res.x[0]
+            thr_fit = float(fix_thr) if fix_thr is not None else max(0.0, res.x[1])
+            logM0 = np.log10(Mx_fit)
+            thr0 = thr_fit
             M_now = Mx_fit
             if verbose:
                 print(f'  [iter {_it}] M={Mx_fit:.4e}  thr={thr_fit:.1f} DN  '
@@ -948,13 +976,14 @@ def fit_migration_params(cube, M_init=1.0e-6, thr_init=50.0, bg_mask=None,
 
 
 def correct_bfe_rcd(cube, method='migration',
-                    M_mig=1.0e-6, M_mig_y=1, thr_mig=50.0,
+                    M_mig=4.2e-7, M_mig_y=1, thr_mig=37.2,
                     A_bfe=1.035e-6, alpha_bfe=3.43, b_bfe=-0.50, c_bfe=0.056,
                     bg_mask=None, late_groups=None, verbose=False,
                     fit_bfe=False, sci_mask=None,
                     bfe_early_groups=None, bfe_late_groups=None,
                     ap_radius=5, cut=20, fit_r=10,
                     star_x=None, star_y=None,
+                    fix_M=None, fix_thr=None,
                     diagnostics=False, save_path=None):
     """
     Joint BFE + reset-decay correction for MIRI ramp data.
@@ -1055,7 +1084,8 @@ def correct_bfe_rcd(cube, method='migration',
                 cube, M_init=M_mig, thr_init=thr_mig, bg_mask=bg_mask,
                 sci_mask=sci_mask, bfe_early_groups=bfe_early_groups,
                 bfe_late_groups=bfe_late_groups, ap_radius=ap_radius, cut=cut,
-                fit_r=fit_r, verbose=verbose, aniso=(M_mig_y is None))
+                fit_r=fit_r, verbose=verbose, aniso=(M_mig_y is None),
+                fix_M=fix_M, fix_thr=fix_thr)
             if Mx_fit is None:
                 if verbose:
                     print('No source meets brightness threshold — skipping BFE correction')
