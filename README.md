@@ -37,9 +37,6 @@ from rampdoctor.ramp_correction import correct_bfe_rcd
 
 # Pipeline-processed (ramp.fits) data — linearity already applied
 cube_cor = correct_bfe_rcd(cube, fit_bfe=True, verbose=True)
-
-# Raw uncal data — jointly fit detector linearity with BFE parameters
-cube_cor = correct_bfe_rcd(cube, fit_bfe=True, fit_a_lin=True, verbose=True)
 ```
 
 Pass `diagnostics=True` and a `save_path` to produce diagnostic figures
