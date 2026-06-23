@@ -19,7 +19,7 @@ signature of the brightest source in the field; the decay timescale is fit
 from background pixels. On JWST MIRI time-series observations the joint
 correction reduces group-level lightcurve RMS by 3–10×.
 
-The package operates on raw (`uncal`) or pipeline-processed (`ramp`) SCI
+The package operates pimarily on pipeline-processed (`ramp`) SCI
 cubes of shape `(n_int, n_groups, ny, nx)`. It is developed and validated on
 MIRI but the approach applies to any instrument with non-destructive
 up-the-ramp sampling.
