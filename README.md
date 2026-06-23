@@ -100,6 +100,7 @@ re-fit prevents the decay and migration parameters from absorbing each other.
 |---|---|---|---|---|---|
 | Wolf 359 | ramp.fits | 4.32×10⁻⁷ | 37.8 DN | 1.03% | 0.21% |
 | TRAPPIST-1 | ramp.fits | 4.09×10⁻⁷ | 36.6 DN | 0.80% | 0.22% |
+| EV Lac | ramp.fits | 2.40×10⁻⁷ | 74.9 DN | 0.65% | 0.16% |
 
 The consistent `M` and threshold across two independent MIRI targets
 (observed in different modes) support their use as instrument-level
