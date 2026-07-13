@@ -45,7 +45,7 @@ class RampDoctor:
     """
 
     def __init__(self, cube=None, file=None, dq=None, method='migration',
-                 M_mig=1.0e-6, M_mig_y=1, thr_mig=50.0, A_bfe=1.035e-6,
+                 M_mig=4.2e-7, M_mig_y=1, thr_mig=37.2, A_bfe=1.035e-6,
                  alpha_bfe=3.43, b_bfe=-0.50, c_bfe=0.056,
                  bg_mask=None, sci_mask=None, verbose=False):
         self.file = Path(file) if file is not None else None

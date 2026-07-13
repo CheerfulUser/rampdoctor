@@ -595,6 +595,11 @@ def fit_bfe_params(cube, alpha_bfe=3.43, b_bfe=None, c_bfe=None,
         vabs = np.nanpercentile(np.abs(obs_diff), 99.5)
         ext = [-cut - 0.5, cut + 0.5, -cut - 0.5, cut + 0.5]
 
+        import math
+        _exp = int(math.floor(math.log10(vabs))) if vabs > 0 else 0
+        _scale = 10 ** _exp
+        _exp_str = f'$\\times10^{{{_exp}}}$' if _exp != 0 else ''
+
         fig, axes = plt.subplots(2, 2, figsize=(10, 8))
         for ax, img, title in [
             (axes[0, 0], obs_diff, 'Observed late$-$early'),
@@ -602,20 +607,20 @@ def fit_bfe_params(cube, alpha_bfe=3.43, b_bfe=None, c_bfe=None,
              f'Model (A={A_bfe_fit:.2e}, α={alpha_fit:.2f}, b={b_fit:.2f}, c={c_fit:.3f})'),
             (axes[1, 0], res_diff, 'Residual (obs$-$model)'),
         ]:
-            im = ax.imshow(img, origin='lower', cmap='RdBu_r',
-                           vmin=-vabs, vmax=vabs, extent=ext)
-            fig.colorbar(im, ax=ax, label=r'Norm. $\Delta$flux')
+            im = ax.imshow(img / _scale, origin='lower', cmap='RdBu_r',
+                           vmin=-vabs / _scale, vmax=vabs / _scale, extent=ext)
+            fig.colorbar(im, ax=ax, label=rf'Norm. $\Delta$flux {_exp_str}')
             ax.set_title(title)
             ax.set_xlabel(r'$\Delta x$ (px)')
             ax.set_ylabel(r'$\Delta y$ (px)')
 
         ax = axes[1, 1]
-        ax.plot(r_int, rp_obs, 'k-', lw=1.5, label='Observed')
-        ax.plot(r_int, rp_sim, color='C3', ls='--', lw=1.5, label='Model')
+        ax.plot(r_int, rp_obs / _scale, 'k-', lw=1.5, label='Observed')
+        ax.plot(r_int, rp_sim / _scale, color='C3', ls='--', lw=1.5, label='Model')
         ax.axhline(0, color='k', lw=0.5, ls=':')
         ax.axvline(fit_r, color='C0', lw=1.0, ls='--', label=f'fit_r = {fit_r} px')
         ax.set_xlabel('Radius (px)')
-        ax.set_ylabel(r'Mean $\Delta$flux')
+        ax.set_ylabel(rf'Mean $\Delta$flux {_exp_str}')
         ax.set_title('Radial profile')
         ax.legend(fontsize=8)
 
@@ -935,6 +940,12 @@ def fit_migration_params(cube, M_init=4.2e-7, thr_init=37.2, bg_mask=None,
         vabs = np.nanpercentile(np.abs(obs), 99.5)
         ext = [-cut - 0.5, cut + 0.5, -cut - 0.5, cut + 0.5]
 
+        # Auto-scale to nearest 10^n so values are readable
+        import math
+        _exp = int(math.floor(math.log10(vabs))) if vabs > 0 else 0
+        _scale = 10 ** _exp
+        _exp_str = f'$\\times10^{{{_exp}}}$' if _exp != 0 else ''
+
         fig, axes = plt.subplots(2, 2, figsize=(10, 8))
         if aniso:
             title_model = f'Model (Mx={Mx_fit:.2e}, My={My_fit:.2e}, thr={thr_fit:.1f})'
@@ -945,20 +956,20 @@ def fit_migration_params(cube, M_init=4.2e-7, thr_init=37.2, bg_mask=None,
             (axes[0, 1], sim,  title_model),
             (axes[1, 0], res,  'Residual (obs$-$model)'),
         ]:
-            im = ax.imshow(img, origin='lower', cmap='RdBu_r',
-                           vmin=-vabs, vmax=vabs, extent=ext)
-            fig.colorbar(im, ax=ax, label=r'Norm. $\Delta$flux')
+            im = ax.imshow(img / _scale, origin='lower', cmap='RdBu_r',
+                           vmin=-vabs / _scale, vmax=vabs / _scale, extent=ext)
+            fig.colorbar(im, ax=ax, label=rf'Norm. $\Delta$flux {_exp_str}')
             ax.set_title(title)
             ax.set_xlabel(r'$\Delta x$ (px)')
             ax.set_ylabel(r'$\Delta y$ (px)')
 
         ax = axes[1, 1]
-        ax.plot(r_int, rp_obs, 'k-', lw=1.5, label='Observed')
-        ax.plot(r_int, rp_sim, color='C3', ls='--', lw=1.5, label='Model')
+        ax.plot(r_int, rp_obs / _scale, 'k-', lw=1.5, label='Observed')
+        ax.plot(r_int, rp_sim / _scale, color='C3', ls='--', lw=1.5, label='Model')
         ax.axhline(0, color='k', lw=0.5, ls=':')
         ax.axvline(fit_r, color='C0', lw=1.0, ls='--', label=f'fit_r = {fit_r} px')
         ax.set_xlabel('Radius (px)')
-        ax.set_ylabel(r'Mean $\Delta$flux')
+        ax.set_ylabel(rf'Mean $\Delta$flux {_exp_str}')
         ax.set_title('Radial profile')
         ax.legend(fontsize=8)
 
@@ -984,6 +995,8 @@ def correct_bfe_rcd(cube, method='migration',
                     ap_radius=5, cut=20, fit_r=10,
                     star_x=None, star_y=None,
                     fix_M=None, fix_thr=None,
+                    nonparametric=True,
+                    return_stages=False,
                     diagnostics=False, save_path=None):
     """
     Joint BFE + reset-decay correction for MIRI ramp data.
@@ -1047,6 +1060,15 @@ def correct_bfe_rcd(cube, method='migration',
     ap_radius, cut, fit_r : float
         PSF normalisation aperture, cutout half-size, and fit radius in pixels.
         Only used when fit_bfe=True.
+    nonparametric : bool, default True
+        If True, apply step 3 (per-pixel per-group median subtraction with
+        flat-rate restoration). Set to False to skip this step and return
+        only the parametric BFE + RCD correction.
+    return_stages : bool, default False
+        If True, return a tuple ``(cube_cor, stages)`` where ``stages`` is a
+        dict with keys ``'grads_raw'``, ``'grads_bfe'``, ``'grads_joint'``.
+        The RCD-only corrected gradients are
+        ``grads_raw - (grads_bfe - grads_joint)`` (BFE kept, RCD removed).
     diagnostics : bool
         If True, save a figure showing the global tau fit, the decay
         amplitude map, the BFE correction size per group, and the
@@ -1060,6 +1082,9 @@ def correct_bfe_rcd(cube, method='migration',
     cube_cor : ndarray (n_int, n_groups, ny, nx)
         Corrected SCI cube reconstructed from corrected gradients.
         Group 0 is unchanged (reset level reference).
+        If ``return_stages=True``, returns ``(cube_cor, stages)`` where
+        ``stages`` is a dict with keys ``'grads_raw'``, ``'grads_bfe'``,
+        ``'grads_joint'``.
     """
     from scipy.signal import fftconvolve
 
@@ -1196,12 +1221,14 @@ def correct_bfe_rcd(cube, method='migration',
             grads_joint[:, g] = grads_bfe[:, g] - decay_g[None]
 
     # Step 3: non-parametric median subtraction
-    med_joint = np.median(grads_joint[:, :n_grads], axis=0)   # (n_grads, ny, nx)
-    C_hat = np.mean(med_joint[late_groups], axis=0)            # (ny, nx)
-
-    grads_cor = grads_joint.copy()
-    for g in range(n_grads):
-        grads_cor[:, g] = grads_joint[:, g] - med_joint[g][None] + C_hat[None]
+    if nonparametric:
+        med_joint = np.median(grads_joint[:, :n_grads], axis=0)   # (n_grads, ny, nx)
+        C_hat = np.mean(med_joint[late_groups], axis=0)            # (ny, nx)
+        grads_cor = grads_joint.copy()
+        for g in range(n_grads):
+            grads_cor[:, g] = grads_joint[:, g] - med_joint[g][None] + C_hat[None]
+    else:
+        grads_cor = grads_joint
 
     # Reconstruct corrected cube: group 0 unchanged, integrate corrected gradients
     cube_cor = cube.copy()
@@ -1275,21 +1302,24 @@ def correct_bfe_rcd(cube, method='migration',
             print(f'Saved correction diagnostics to {save_path}')
 
         if star_x is not None and star_y is not None:
-            _diag_pixel_ramps(
-                cube, grads_raw, grads_bfe, grads_joint, grads_cor,
-                star_x, star_y, n_grads_all,
-                save_path=str(save_path).replace('.png', '_pixel_ramps.png'),
-                verbose=verbose)
-            _diag_pixel_locations(
+            r_between, r_ring = _diag_pixel_locations(
                 grads_raw, star_x, star_y, n_grads, ny, nx,
                 save_path=str(save_path).replace('.png', '_pixel_locations.png'),
                 verbose=verbose)
+            _diag_pixel_ramps(
+                cube, grads_raw, grads_bfe, grads_joint, grads_cor,
+                star_x, star_y, n_grads_all, r_between, r_ring,
+                save_path=str(save_path).replace('.png', '_pixel_ramps.png'),
+                verbose=verbose)
 
+    if return_stages:
+        return cube_cor, {'grads_raw': grads_raw, 'grads_bfe': grads_bfe,
+                          'grads_joint': grads_joint}
     return cube_cor
 
 
 def _diag_pixel_ramps(cube, grads_raw, grads_bfe, grads_joint, grads_cor,
-                      star_x, star_y, n_grads_all,
+                      star_x, star_y, n_grads_all, r_between, r_ring,
                       save_path='bfe_rcd_pixel_ramps.png', verbose=False):
     import matplotlib
     matplotlib.use('Agg')
@@ -1304,8 +1334,8 @@ def _diag_pixel_ramps(cube, grads_raw, grads_bfe, grads_joint, grads_cor,
 
     diag_pixels = [
         (star_y, star_x, 'Star centre ($r=0$)'),
-        (star_y, star_x + 3, r'Between core \& ring ($r=3$)'),
-        (star_y, star_x + 5, r'On ring ($r=5$)'),
+        (star_y, star_x + r_between, rf'Between core \& ring ($r={r_between}$)'),
+        (star_y, star_x + r_ring,    rf'On ring ($r={r_ring}$)'),
         (sky_y, sky_x, 'Sky'),
     ]
 
@@ -1406,11 +1436,13 @@ def _diag_pixel_ramps(cube, grads_raw, grads_bfe, grads_joint, grads_cor,
         print(f'Saved pixel ramp diagnostics to {save_path}')
 
 
+
 def _diag_pixel_locations(grads_raw, star_x, star_y, n_grads, ny, nx,
                            save_path='bfe_rcd_pixel_locations.png', verbose=False):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    import math
 
     med_raw = np.median(grads_raw[:, :n_grads], axis=0)   # (n_grads, ny, nx)
 
@@ -1439,15 +1471,38 @@ def _diag_pixel_locations(grads_raw, star_x, star_y, n_grads, ny, nx,
 
     early_img = np.mean([_norm_group(g) for g in early_groups_loc], axis=0)
     late_img = np.mean([_norm_group(g) for g in late_groups_loc], axis=0)
-    bfe_img_scaled = (late_img - early_img) / 1e-4
+    bfe_img = late_img - early_img
+    bfe_img_scaled = bfe_img / 1e-4
+
+    # Derive r_between (first zero crossing) and r_ring (peak after crossing)
+    r_int = np.arange(0, cut)
+    rr    = np.round(r_map).astype(int)
+    rp    = np.array([np.nanmean(bfe_img[rr == ri]) for ri in r_int])
+
+    r_zero = None
+    sign0  = np.sign(rp[0]) if rp[0] != 0 else 1
+    for i in range(1, len(rp)):
+        if np.sign(rp[i]) != 0 and np.sign(rp[i]) != sign0:
+            frac   = abs(rp[i-1]) / (abs(rp[i-1]) + abs(rp[i]) + 1e-30)
+            r_zero = r_int[i-1] + frac
+            break
+    if r_zero is None:
+        r_zero = cut // 3
+
+    r_between = max(1, int(round(r_zero)))
+    search_start = r_between + 1
+    if search_start < len(rp):
+        r_ring = search_start + int(np.argmax(rp[search_start:]))
+    else:
+        r_ring = r_between + 1
 
     sky_y = max(5, min(ny - 5, star_y - 15))
     sky_x = max(5, min(nx - 5, star_x + 10))
 
     loc_pixels = [
         (star_y, star_x, 'Star centre', 'C3', '*', 12),
-        (star_y, star_x + 3, r'Between core \& ring ($r=3$)', 'C0', 'o', 8),
-        (star_y, star_x + 5, r'On ring ($r=5$)', 'C1', 's', 8),
+        (star_y, star_x + r_between, rf'Between core \& ring ($r={r_between}$)', 'C0', 'o', 8),
+        (star_y, star_x + r_ring,    rf'On ring ($r={r_ring}$)',                  'C1', 'X', 8),
         (sky_y, sky_x, 'Sky', 'C4', 'D', 6),
     ]
 
@@ -1463,7 +1518,7 @@ def _diag_pixel_locations(grads_raw, star_x, star_y, n_grads, ny, nx,
 
     for py, px, label, color, marker, ms in loc_pixels:
         ax.plot(px, py, marker=marker, color=color, ms=ms, mew=1.5,
-                markeredgecolor='w', zorder=5, label=label)
+                markeredgecolor='w', ls='none', zorder=5, label=label)
 
     ax.set_xlabel(r'$x$ (px)')
     ax.set_ylabel(r'$y$ (px)')
@@ -1476,6 +1531,7 @@ def _diag_pixel_locations(grads_raw, star_x, star_y, n_grads, ny, nx,
     plt.rcParams.update({'font.family': 'sans-serif', 'text.usetex': False, 'font.size': 10})
     if verbose:
         print(f'Saved pixel location diagnostics to {save_path}')
+    return r_between, r_ring
 
 
 def correct_ramp(cube, C_map):
