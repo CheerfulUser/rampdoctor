@@ -2,6 +2,8 @@ import numpy as np
 from pathlib import Path
 from scipy.interpolate import griddata
 from scipy.optimize import curve_fit
+from scipy.stats import f as f_dist
+from astropy.stats import sigma_clipped_stats
 
 
 def build_correction_map(cube, mask=None):
@@ -986,6 +988,200 @@ def fit_migration_params(cube, M_init=4.2e-7, thr_init=37.2, bg_mask=None,
     return Mx_fit, My_fit, thr_fit, sx, sy
 
 
+def _fit_charge_adaptive_scale(grads_bfe, n_grads, Adec_map, tau, delta_map,
+                               n_sigma=5.0, min_excess_dn=100.0,
+                               min_ramp_median_dn=500.0, sci_mask=None,
+                               fit_alpha=0.05, verbose=False):
+    """
+    Detect integrations where a pixel's whole ramp is far brighter than its
+    own baseline for that pixel, and fit an extra per-pixel-per-integration
+    reset-decay amplitude for just those integrations, on top of the
+    existing median-derived Adec_map.
+
+    The per-pixel Adec_map fit (in correct_bfe_rcd) uses the median over
+    integrations, so it implicitly represents a "typical" charge level. A
+    transient (moving object, unmasked cosmic ray) that makes a pixel's
+    ramp much brighter for a whole integration increases the true
+    reset-decay amplitude there, which the fixed per-pixel Adec_map can't
+    capture on its own.
+
+    Detection uses the median gradient over each integration's ramp at each
+    pixel, which is robust to a single-group cosmic-ray spike landing at
+    any group (a CR shows up as one outlier value among many groups, so it
+    barely moves the median) while still responding to genuine whole-ramp
+    brightening (which elevates most/all groups together).
+
+    A pixel's own charge-vs-excess relation can't be pooled across pixels
+    (different pixels respond very differently at the same brightness), so
+    each flagged (pixel, integration) is fit independently. Doing that from
+    a single point (e.g. just the g=0 deviation from a trend fit through
+    later groups) is circular -- it is guaranteed to zero out that one
+    point regardless of whether the deviation was real or just noise, and
+    ignores that the "trend" groups themselves still carry a small
+    (non-negligible) tail of the same decay. Instead, for each flagged
+    ramp, an extra decay amplitude is fit jointly against *every* group in
+    one linear least-squares solve:
+
+        grads_fixed[g] = C + slope*g + extra_A * exp(-g/tau)
+
+    where ``grads_fixed`` is this pixel's gradients after the existing
+    (non-adaptive) Adec_map/delta_map correction, and ``tau`` is the same
+    fixed, detector-wide decay timescale used everywhere else (never
+    refit per-ramp or per-pixel). All three parameters come from the same
+    fit, so the linear trend and the decay amplitude are disentangled
+    using the whole ramp rather than an arbitrary early/late group split.
+
+    Parameters
+    ----------
+    grads_bfe : ndarray (n_int, n_grads_all, ny, nx)
+        BFE-corrected gradients (Step 1 output of correct_bfe_rcd).
+    n_grads : int
+        Number of gradients to correct (excludes the last-frame anomaly).
+    Adec_map : ndarray (ny, nx)
+        Per-pixel decay amplitude from the existing median-based fit.
+    tau : float
+        Fixed, detector-wide reset-decay timescale (groups). Shared with
+        the main correct_bfe_rcd fit; never refit here.
+    delta_map : ndarray (ny, nx)
+        Per-pixel first-frame offset from the existing median-based fit.
+    n_sigma : float
+        Threshold, in robust (MAD-based) sigma above a pixel's own baseline
+        median gradient, for flagging an integration as "whole ramp bright".
+    min_excess_dn : float
+        Floor, in DN, on the excess required to flag: the threshold is
+        baseline + max(n_sigma*robust_sigma, min_excess_dn). Protects
+        against pixels with an artificially small noise estimate making
+        n_sigma*robust_sigma trivially small in absolute terms.
+    min_ramp_median_dn : float
+        Floor, in DN, on the flagged ramp_median value itself (not the
+        excess above baseline). Excludes low-brightness pixels where even
+        a "significant" excursion is small in absolute terms.
+    sci_mask : ndarray (ny, nx) bool, optional
+        True = good science pixels. Non-science pixels (reference columns,
+        etc.) have very different statistical behavior and should never be
+        flagged. Strongly recommended whenever available.
+    fit_alpha : float, default 0.05
+        Significance level for the F-test comparing the linear+decay model
+        against a linear-only model. A ramp's fitted extra_A is only used
+        if the decay term reduces the residual sum of squares by more than
+        chance at this significance level; otherwise extra_A=0 for that
+        ramp (falls back to the existing per-pixel Adec_map only).
+
+    Returns
+    -------
+    scale : ndarray (n_int, ny, nx)
+        Multiplicative factor (>=1) to apply to Adec_map per integration,
+        equal to 1 + extra_A/Adec_map for flagged (pixel, integration)
+        pairs and 1 elsewhere.
+    median_extra_A : float or None
+        Median fitted extra amplitude (DN) across flagged points, or None
+        if there weren't enough flagged points to fit anything.
+    """
+    n_int, _, ny, nx = grads_bfe.shape
+
+    # Per-integration "typical" ramp level: a plain median over the
+    # n_grads (~11) points in that integration's ramp. Iterative
+    # sigma-clipping is unreliable at this sample size -- astropy always
+    # performs at least one clip pass regardless of maxiters, which can
+    # asymmetrically discard legitimate low (or high) values on a small
+    # sample and bias the result away from the true center. A plain
+    # median is already fairly resistant to a single-group CR spike (one
+    # outlier among ~11 points has limited leverage on the median).
+    ramp_median = np.median(grads_bfe[:, :n_grads], axis=1)           # (n_int, ny, nx)
+
+    # Per-pixel baseline and robust scatter across integrations, same
+    # reasoning: sigma-clipping excludes the minority of integrations
+    # where a real transient is present from biasing the "typical" value.
+    # Clip sigma is intentionally wide (15, not e.g. 3-5): too aggressive a
+    # clip here excludes genuine, modest pixel-to-pixel scatter (e.g. a
+    # slowly-decaying persistence trend spread over many integrations)
+    # from the sigma estimate, artificially shrinking it and making
+    # ordinary variation look like a significant excursion. At sigma=15 it
+    # still excludes a real large transient (which should dominate its own
+    # detection) without swallowing normal scatter into "not baseline".
+    _, baseline_median, robust_sigma = sigma_clipped_stats(
+        ramp_median, axis=0, sigma=15.0, maxiters=5,
+        cenfunc='median', stdfunc='mad_std')                          # (ny, nx) each
+
+    # min_excess_dn is a floor on the excess required to flag, not an
+    # independent condition: a pixel with an artificially tiny noise
+    # estimate can make n_sigma*robust_sigma trivially small in absolute
+    # terms, so the excess above baseline must be at least min_excess_dn
+    # DN regardless of how many "sigma" that nominally represents.
+    threshold = baseline_median + np.maximum(n_sigma * robust_sigma, min_excess_dn)
+    flagged = (ramp_median > threshold[None]) & (ramp_median >= min_ramp_median_dn)
+
+    valid_pixel = (Adec_map > 0.5) & (baseline_median > 0)
+    if sci_mask is not None:
+        valid_pixel = valid_pixel & sci_mask.astype(bool)
+    flagged = flagged & valid_pixel[None]
+    n_flagged = int(flagged.sum())
+    if verbose:
+        print(f'  charge_adaptive: {n_flagged} flagged (pixel,integration) pairs')
+    if n_flagged < 10:
+        if verbose:
+            print('  charge_adaptive: too few flagged points — skipping scaling')
+        return np.ones((n_int, ny, nx)), None
+
+    # Baseline (non-adaptive) RCD-corrected gradients: isolates any extra
+    # charge-dependent excess above what the existing per-pixel fit already
+    # removes, which is what the per-ramp joint fit below targets.
+    g_arr = np.arange(n_grads)
+    exp_g = np.exp(-g_arr / tau)
+    grads_fixed = grads_bfe[:, :n_grads].copy()
+    grads_fixed -= Adec_map[None, None] * exp_g[None, :, None, None]
+    grads_fixed[:, 0] += delta_map[None]
+
+    # Shared design matrices (same g_arr/tau for every ramp) -> shared
+    # pseudo-inverses, reused for every flagged (pixel, integration).
+    # X_lin: linear-trend-only model (no decay term), the null hypothesis.
+    # X_full: linear trend + decay term, the model actually applied.
+    X_lin = np.column_stack([np.ones(n_grads), g_arr])         # (n_grads, 2)
+    X_full = np.column_stack([np.ones(n_grads), g_arr, exp_g])  # (n_grads, 3)
+    X_lin_pinv = np.linalg.pinv(X_lin)
+    X_full_pinv = np.linalg.pinv(X_full)
+
+    ints, ys, xs = np.where(flagged)
+    ramps = grads_fixed[ints, :, ys, xs]                      # (n_flagged, n_grads)
+
+    coefs_lin = ramps @ X_lin_pinv.T                          # (n_flagged, 2)
+    resid_lin = ramps - coefs_lin @ X_lin.T
+    rss_lin = np.sum(resid_lin**2, axis=1)
+
+    coefs_full = ramps @ X_full_pinv.T                        # (n_flagged, 3)
+    resid_full = ramps - coefs_full @ X_full.T
+    rss_full = np.sum(resid_full**2, axis=1)
+
+    # F-test: does adding the decay term (1 extra parameter) significantly
+    # reduce the residual sum of squares versus the linear-only model? A
+    # per-ramp least-squares amplitude will always come out nonzero even
+    # when the ramp's shape is pure noise/trend -- this is what stops that
+    # amplitude from being applied when it isn't actually explaining the
+    # ramp's shape any better than a straight line would.
+    dof_full = n_grads - 3
+    safe_rss_full = np.where(rss_full > 0, rss_full, 1e-12)
+    F_stat = np.where(rss_full > 0,
+                       (rss_lin - rss_full) / (safe_rss_full / dof_full),
+                       np.inf)
+    F_crit = f_dist.ppf(1 - fit_alpha, 1, dof_full)
+    good_fit = F_stat > F_crit
+
+    extra_A = np.where(good_fit, np.clip(coefs_full[:, 2], 0.0, None), 0.0)
+
+    if verbose:
+        n_good = int(good_fit.sum())
+        print(f'  charge_adaptive: full-ramp joint fit, {n_good}/{n_flagged} ramps '
+              f'passed the decay-term significance test (alpha={fit_alpha}), '
+              f'median extra amplitude {np.median(extra_A[good_fit]) if n_good else 0:.2f} DN')
+
+    safe_A = np.where(Adec_map > 0.5, Adec_map, 1.0)
+    extra_A_map = np.zeros((n_int, ny, nx))
+    extra_A_map[ints, ys, xs] = extra_A
+    scale_flagged = 1.0 + extra_A_map / safe_A[None]
+    scale = np.where(flagged, scale_flagged, 1.0)
+    return scale, float(np.median(extra_A))
+
+
 def correct_bfe_rcd(cube, method='migration',
                     M_mig=4.2e-7, M_mig_y=1, thr_mig=37.2,
                     A_bfe=1.035e-6, alpha_bfe=3.43, b_bfe=-0.50, c_bfe=0.056,
@@ -996,6 +1192,9 @@ def correct_bfe_rcd(cube, method='migration',
                     star_x=None, star_y=None,
                     fix_M=None, fix_thr=None,
                     nonparametric=True,
+                    charge_adaptive=False, charge_adaptive_nsigma=5.0,
+                    charge_adaptive_min_excess_dn=100.0,
+                    charge_adaptive_min_ramp_median_dn=500.0,
                     return_stages=False,
                     diagnostics=False, save_path=None):
     """
@@ -1064,6 +1263,31 @@ def correct_bfe_rcd(cube, method='migration',
         If True, apply step 3 (per-pixel per-group median subtraction with
         flat-rate restoration). Set to False to skip this step and return
         only the parametric BFE + RCD correction.
+    charge_adaptive : bool, default False
+        If True, automatically detect integrations where a pixel's whole
+        ramp is much brighter than its own baseline (e.g. a moving object
+        transiting that pixel) and scale up the per-pixel decay amplitude
+        for just those integrations, rather than applying the same
+        median-derived amplitude everywhere. Detection is robust to
+        cosmic-ray hits at any group (uses the median gradient over each
+        integration's ramp, so a single-group spike doesn't trigger it).
+        See ``_fit_charge_adaptive_scale`` for the full method.
+    charge_adaptive_nsigma : float, default 5.0
+        Threshold, in robust sigma above a pixel's own baseline, for
+        flagging an integration as "whole ramp bright". Only used when
+        charge_adaptive=True.
+    charge_adaptive_min_excess_dn : float, default 100.0
+        Floor, in DN, on the excess required to flag: the effective
+        threshold is baseline + max(charge_adaptive_nsigma*robust_sigma,
+        charge_adaptive_min_excess_dn). Protects against pixels with an
+        artificially small noise estimate making the sigma-based threshold
+        trivially small in absolute terms. Only used when
+        charge_adaptive=True.
+    charge_adaptive_min_ramp_median_dn : float, default 500.0
+        Floor, in DN, on the flagged ramp_median value itself (not the
+        excess above baseline). Excludes low-brightness pixels where even
+        a "significant" excursion is small in absolute terms. Only used
+        when charge_adaptive=True.
     return_stages : bool, default False
         If True, return a tuple ``(cube_cor, stages)`` where ``stages`` is a
         dict with keys ``'grads_raw'``, ``'grads_bfe'``, ``'grads_joint'``.
@@ -1212,13 +1436,23 @@ def correct_bfe_rcd(cube, method='migration',
     Adec_map = params[1].reshape(ny, nx)
     delta_map = params[2].reshape(ny, nx)
 
+    charge_scale = np.ones((n_int, ny, nx))
+    charge_scale_p = None
+    if charge_adaptive:
+        charge_scale, charge_scale_p = _fit_charge_adaptive_scale(
+            grads_bfe, n_grads, Adec_map, tau, delta_map,
+            n_sigma=charge_adaptive_nsigma,
+            min_excess_dn=charge_adaptive_min_excess_dn,
+            min_ramp_median_dn=charge_adaptive_min_ramp_median_dn,
+            sci_mask=sci_mask, verbose=verbose)
+
     grads_joint = grads_bfe.copy()
     for g in range(n_grads):
-        decay_g = Adec_map * np.exp(-g / tau)
+        decay_g = Adec_map[None] * charge_scale * np.exp(-g / tau)   # (n_int, ny, nx)
         if g == 0:
-            grads_joint[:, 0] = grads_bfe[:, 0] - decay_g[None] + delta_map[None]
+            grads_joint[:, 0] = grads_bfe[:, 0] - decay_g + delta_map[None]
         else:
-            grads_joint[:, g] = grads_bfe[:, g] - decay_g[None]
+            grads_joint[:, g] = grads_bfe[:, g] - decay_g
 
     # Step 3: non-parametric median subtraction
     if nonparametric:
