@@ -34,6 +34,27 @@ class RampDoctor:
         True = background pixels for the global tau fit.
     sci_mask : ndarray (ny, nx) bool, optional
         True = good science pixels, used during source detection.
+    instrument : {'miri', 'nircam'}, default 'miri'
+        Case-insensitive. Selects instrument-appropriate defaults for
+        fit_rcd_decay and drop_last_gradient (see below), and for the
+        default early/late group selection in fit_bfe(). MIRI's Si:As
+        detectors show reset charge decay (RCD) and a last-frame anomaly;
+        NIRCam's HgCdTe detectors show neither.
+    fit_rcd_decay : bool, optional
+        If True, fit/apply the parametric RCD decay model. Defaults to
+        True for instrument='miri', False for instrument='nircam'.
+    drop_last_gradient : bool, optional
+        If True, exclude the final group-to-group gradient (MIRI's
+        last-frame anomaly) from fitting/correction. Defaults to True for
+        instrument='miri', False for instrument='nircam'.
+    master_ref : ndarray (ny, nx), optional
+        A clean, deep, cosmic-ray-free detection image on the same pixel
+        grid as ``cube``, used for source detection in fit_bfe() instead of
+        the cube's own median gradient. Strongly recommended: a single
+        ramp's median gradient can be dominated by an undetected cosmic-ray
+        hit that survives median rejection, silently corrupting the fit
+        (verified directly on real NIRCam data — see
+        fit_bfe_params' master_ref docstring).
     verbose : bool
 
     Examples
@@ -47,7 +68,10 @@ class RampDoctor:
     def __init__(self, cube=None, file=None, dq=None, method='migration',
                  M_mig=4.2e-7, M_mig_y=1, thr_mig=37.2, A_bfe=1.035e-6,
                  alpha_bfe=3.43, b_bfe=-0.50, c_bfe=0.056,
-                 bg_mask=None, sci_mask=None, verbose=False):
+                 bg_mask=None, sci_mask=None,
+                 instrument='miri', fit_rcd_decay=None, drop_last_gradient=None,
+                 master_ref=None, psf_fwhm_px=None,
+                 verbose=False):
         self.file = Path(file) if file is not None else None
         if file is not None:
             from astropy.io import fits
@@ -72,6 +96,11 @@ class RampDoctor:
         self.c_bfe = c_bfe
         self.bg_mask = bg_mask
         self.sci_mask = sci_mask
+        self.instrument = instrument.lower() if instrument else instrument
+        self.fit_rcd_decay = fit_rcd_decay
+        self.drop_last_gradient = drop_last_gradient
+        self.master_ref = master_ref
+        self.psf_fwhm_px = psf_fwhm_px
         self.verbose = verbose
 
         self.cube_cor = None
@@ -95,7 +124,7 @@ class RampDoctor:
         return np.diff(self.cube_cor, axis=1)
 
     def fit_bfe(self, fit_alpha=False, bfe_early_groups=None,
-                bfe_late_groups=None, ap_radius=5, cut=20, fit_r=None,
+                bfe_late_groups=None, ap_radius=5, cut=None, fit_r=None,
                 diagnostics=False, save_path=None):
         """
         Fit the BFE parameters from the brightest source, using the configured
@@ -110,12 +139,15 @@ class RampDoctor:
             no source met the brightness threshold.
         """
         if self.method == 'migration':
-            Mx, My, thr, sx, sy = fit_migration_params(
+            Mx, My, thr, sx, sy, _a_lin = fit_migration_params(
                 self.cube, M_init=self.M_mig, thr_init=self.thr_mig,
                 bg_mask=self.bg_mask, sci_mask=self.sci_mask,
                 bfe_early_groups=bfe_early_groups, bfe_late_groups=bfe_late_groups,
                 ap_radius=ap_radius, cut=cut, fit_r=fit_r, verbose=self.verbose,
                 aniso=(self.M_mig_y is None),
+                instrument=self.instrument, fit_rcd_decay=self.fit_rcd_decay,
+                drop_last_gradient=self.drop_last_gradient, master_ref=self.master_ref,
+                dq=self.dq, psf_fwhm_px=self.psf_fwhm_px,
                 diagnostics=diagnostics, save_path=save_path)
             if Mx is None:
                 return None
@@ -131,6 +163,9 @@ class RampDoctor:
             sci_mask=self.sci_mask, bfe_early_groups=bfe_early_groups,
             bfe_late_groups=bfe_late_groups, ap_radius=ap_radius,
             cut=cut, fit_r=fit_r, verbose=self.verbose,
+            instrument=self.instrument, fit_rcd_decay=self.fit_rcd_decay,
+            drop_last_gradient=self.drop_last_gradient, master_ref=self.master_ref,
+            dq=self.dq, psf_fwhm_px=self.psf_fwhm_px,
             diagnostics=diagnostics, save_path=save_path)
 
         A_fit, alpha_fit, b_fit, c_fit, sx, sy = result
@@ -183,6 +218,9 @@ class RampDoctor:
             bg_mask=self.bg_mask, late_groups=late_groups,
             sci_mask=self.sci_mask, verbose=self.verbose,
             star_x=self.star_x, star_y=self.star_y,
+            instrument=self.instrument, fit_rcd_decay=self.fit_rcd_decay,
+            drop_last_gradient=self.drop_last_gradient, master_ref=self.master_ref,
+            psf_fwhm_px=self.psf_fwhm_px,
             diagnostics=diagnostics, save_path=save_path, **kwargs)
         return self.cube_cor
 
